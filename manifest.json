@@ -1,0 +1,25 @@
+{
+  "name": "Design Project Manager",
+  "short_name": "DPM",
+  "description": "Professional interior design project manager — syncs via OneDrive",
+  "start_url": "/dpm/",
+  "scope": "/dpm/",
+  "display": "standalone",
+  "background_color": "#F5F3F0",
+  "theme_color": "#1A1818",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
