@@ -180,11 +180,71 @@ async function graphGetUserInfo() {
   return res.json();
 }
 
+// Create OneDrive folder via Graph API
+async function graphCreateFolder(folderPath){
+  try{
+    const token=await getToken();
+    // Split path and create each level
+    const parts=folderPath.split('/').filter(Boolean);
+    let currentPath='';
+    for(const part of parts){
+      currentPath=currentPath?currentPath+'/'+part:part;
+      const res=await fetch(`${GRAPH}/me/drive/root:/${currentPath}`,{
+        headers:{Authorization:`Bearer ${token}`}
+      });
+      if(res.status===404){
+        // Create this folder
+        const parentPath=currentPath.substring(0,currentPath.lastIndexOf('/'));
+        const folderName=part;
+        const createUrl=parentPath
+          ?`${GRAPH}/me/drive/root:/${parentPath}:/children`
+          :`${GRAPH}/me/drive/root/children`;
+        await fetch(createUrl,{
+          method:'POST',
+          headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},
+          body:JSON.stringify({name:folderName,folder:{},'@microsoft.graph.conflictBehavior':'ignore'})
+        });
+      }
+    }
+    return true;
+  }catch(e){console.warn('graphCreateFolder failed:',e.message);return false;}
+}
+
+// Create all project folders on OneDrive via Graph API
+async function createProjectFoldersGraph(project){
+  const base=ONEDRIVE_FOLDER;
+  const pf=`${project.code} \u2014 ${project.name}`;
+  const DISC_NAMES={ARC:"ARC \u2014 Architectural",ID:"ID \u2014 Interior Design",LS:"LS \u2014 Landscape",AL:"AL \u2014 Arch. Lighting"};
+  const DISC_SUBS=["Concept Development","Schematic Design","Schematic Design/Zoning Analysis","Schematic Design/Pre-Plans","Schematic Design/3D Visuals","Drawings","Drawings/General","Drawings/GA - Drawings","Drawings/Elevations","Drawings/Details","Drawings/Schedules","Specs","BOQ","3D Visuals"];
+  const paths=[
+    `${base}/${pf}`,
+    `${base}/${pf}/1-General`,
+    `${base}/${pf}/1-General/Contract`,
+    `${base}/${pf}/1-General/Site-Photos`,
+    `${base}/${pf}/1-General/Requirements`,
+    `${base}/${pf}/1-General/MOM`,
+    `${base}/${pf}/1-General/Others`,
+  ];
+  for(const disc of(project.disciplines||[])){
+    const dn=DISC_NAMES[disc]||disc;
+    for(const sub of DISC_SUBS){
+      paths.push(`${base}/${pf}/${dn}/${sub}`);
+    }
+  }
+  let ok=true;
+  for(const path of paths){
+    const r=await graphCreateFolder(path);
+    if(!r)ok=false;
+  }
+  return ok;
+}
+
 // Open OneDrive folder in browser (works on mobile and desktop)
-async function openOneDriveFolder(project, settings, ...parts) {
+async function openOneDriveFolder(project, settings, subPath) {
   const base = ONEDRIVE_FOLDER;
   const projectFolder = `${project.code} \u2014 ${project.name}`;
-  const fullPath = [base, projectFolder, ...parts.filter(Boolean)].join('/');
+  const parts = [base, projectFolder, subPath].filter(Boolean);
+  const fullPath = parts.join('/');
   const url = await graphGetFolderUrl(fullPath);
   if (url) window.open(url, '_blank');else alert('Folder not found in OneDrive. Create the project folders first from the project page.');
 }
@@ -722,13 +782,17 @@ function Badge({
 function FolderBtn({
   project,
   settings,
-  ...pathParts
+  subPath
 }) {
   const [loading, sLoading] = useState(false);
   const open = async e => {
     e.stopPropagation();
     sLoading(true);
-    await openOneDriveFolder(project, settings, ...pathParts);
+    if (subPath) {
+      await openOneDriveFolder(project, settings, subPath);
+    } else {
+      await openOneDriveFolder(project, settings);
+    }
     sLoading(false);
   };
   return /*#__PURE__*/React.createElement("button", {
@@ -876,6 +940,11 @@ function NewProjModal({
     };
     onSave(proj);
     onClose();
+    // Create OneDrive folders via Graph API after modal closes
+    setTimeout(async()=>{
+      try{ await createProjectFoldersGraph(proj); }
+      catch(e){ console.warn('Folder creation failed (project saved):', e.message); }
+    }, 500);
   };
   return /*#__PURE__*/React.createElement(Modal, {
     title: step === 1 ? "New Project — Details" : "New Project — Confirm",
@@ -1632,7 +1701,6 @@ function DrawingDetail({
   }, "Rev ", drawing.rev), discKey && GROUP_FOLDER[drawing.group] && /*#__PURE__*/React.createElement(FolderBtn, {
     project: project,
     settings: settings,
-    [discKey]: DISC_NAMES_FULL[discKey],
     subPath: `${DISC_NAMES_FULL[discKey]}/${GROUP_FOLDER[drawing.group]}`
   })), /*#__PURE__*/React.createElement("div", {
     className: "g2",
@@ -1998,7 +2066,7 @@ function DiscView({
       },
       onClick: e => {
         e.stopPropagation();
-        openOneDriveFolder(project, settings, DISC_NAMES_FULL[disc], GROUP_FOLDER[grp] || '');
+        openOneDriveFolder(project, settings, DISC_NAMES_FULL[disc] + '/' + (GROUP_FOLDER[grp] || ''));
       },
       title: "Open folder"
     }, "\uD83D\uDCC1"))), /*#__PURE__*/React.createElement("table", {
