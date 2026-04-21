@@ -243,7 +243,6 @@ function CreateFoldersBtn({project}) {
 // Create a single folder using PUT — most reliable Graph API method
 // Creates folder at the full path, works even if intermediate folders missing
 async function graphMkDir(token, fullPath) {
-  // Use POST to parent /children — only method that supports conflictBehavior:"ignore"
   const parts = fullPath.split('/');
   const name = parts[parts.length - 1];
   const parentParts = parts.slice(0, -1);
@@ -251,19 +250,13 @@ async function graphMkDir(token, fullPath) {
   const url = encodedParent
     ? `${GRAPH}/me/drive/root:/${encodedParent}:/children`
     : `${GRAPH}/me/drive/root/children`;
+  const body = {name: name, folder: {}};
+  body['@microsoft.graph.conflictBehavior'] = 'ignore';
   const res = await fetch(url, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      name: name,
-      folder: {},
-      "@microsoft.graph.conflictBehavior": "ignore"
-    })
+    headers: {Authorization:`Bearer ${token}`,'Content-Type':'application/json'},
+    body: JSON.stringify(body)
   });
-  // 201=created, 200=ok, 409=already exists — all fine
   if (!res.ok && res.status !== 409) {
     const txt = await res.text().catch(() => '');
     throw new Error(`Cannot create "${fullPath}": ${res.status} ${txt.slice(0,120)}`);
