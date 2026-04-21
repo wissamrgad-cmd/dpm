@@ -243,49 +243,31 @@ function CreateFoldersBtn({project}) {
 // Create a single folder using PUT — most reliable Graph API method
 // Creates folder at the full path, works even if intermediate folders missing
 async function graphMkDir(token, fullPath) {
-  const encoded = fullPath.split('/').map(p => encodeURIComponent(p)).join('/');
-  const url = `${GRAPH}/me/drive/root:/${encoded}`;
+  // Use POST to parent /children — only method that supports conflictBehavior:"ignore"
+  const parts = fullPath.split('/');
+  const name = parts[parts.length - 1];
+  const parentParts = parts.slice(0, -1);
+  const encodedParent = parentParts.map(p => encodeURIComponent(p.trim())).join('/');
+  const url = encodedParent
+    ? `${GRAPH}/me/drive/root:/${encodedParent}:/children`
+    : `${GRAPH}/me/drive/root/children`;
   const res = await fetch(url, {
-    method: 'PATCH',
+    method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({
+      name: name,
       folder: {},
       "@microsoft.graph.conflictBehavior": "ignore"
     })
   });
-  if (res.status === 404) {
-    // Folder doesn't exist — create it via parent POST
-    const parts = fullPath.split('/');
-    const name = parts.pop();
-    const parentPath = parts.join('/');
-    const encodedParent = parts.map(p => encodeURIComponent(p)).join('/');
-    const createUrl = encodedParent
-      ? `${GRAPH}/me/drive/root:/${encodedParent}:/children`
-      : `${GRAPH}/me/drive/root/children`;
-    const cr = await fetch(createUrl, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        name: name,
-        folder: {},
-        "@microsoft.graph.conflictBehavior": "ignore"
-      })
-    });
-    if (!cr.ok && cr.status !== 409) {
-      const txt = await cr.text().catch(() => '');
-      throw new Error(`Cannot create "${fullPath}": ${cr.status} ${txt.slice(0,100)}`);
-    }
-  } else if (!res.ok && res.status !== 409) {
+  // 201=created, 200=ok, 409=already exists — all fine
+  if (!res.ok && res.status !== 409) {
     const txt = await res.text().catch(() => '');
-    throw new Error(`Cannot access "${fullPath}": ${res.status} ${txt.slice(0,100)}`);
+    throw new Error(`Cannot create "${fullPath}": ${res.status} ${txt.slice(0,120)}`);
   }
-  console.log('DPM folder OK:', fullPath);
 }
 
 async function createProjectFoldersGraph(project) {
