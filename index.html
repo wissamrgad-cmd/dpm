@@ -99,7 +99,7 @@ function cleanPath(p) {
 function getDataFolder()    { try{const s=JSON.parse(localStorage.getItem('dpm_paths')||'{}');return cleanPath(s.dataFolder)||ONEDRIVE_FOLDER_DEFAULT;}catch{return ONEDRIVE_FOLDER_DEFAULT;} }
 function getDataFile()      { try{const s=JSON.parse(localStorage.getItem('dpm_paths')||'{}');return s.dataFile||DATA_FILE_DEFAULT;}catch{return DATA_FILE_DEFAULT;} }
 function getProjectsFolder(){ try{const s=JSON.parse(localStorage.getItem('dpm_paths')||'{}');return cleanPath(s.projectsFolder)||ONEDRIVE_FOLDER_DEFAULT;}catch{return ONEDRIVE_FOLDER_DEFAULT;} }
-function savePaths(dataFolder, dataFile, projectsFolder){ localStorage.setItem('dpm_paths',JSON.stringify({dataFolder,dataFile,projectsFolder})); }
+function savePaths(dataFolder, dataFile, projectsFolder, localPath){ localStorage.setItem('dpm_paths',JSON.stringify({dataFolder,dataFile,projectsFolder,localPath})); }
 
 const msalConfig = {
   auth: {
@@ -328,13 +328,45 @@ async function createProjectFoldersGraph(project) {
 }
 
 // Open OneDrive folder in browser (works on mobile and desktop)
+// Get local Windows path to OneDrive folder
+function getLocalProjectsPath() {
+  try {
+    const s = JSON.parse(localStorage.getItem('dpm_paths') || '{}');
+    return (s.localPath || '').trim().replace(/[/\\]+$/, '');
+  } catch { return ''; }
+}
+
 async function openOneDriveFolder(project, settings, subPath) {
   const base = getProjectsFolder();
   const projectFolder = `${project.code} \u2014 ${project.name}`;
   const parts = [base, projectFolder, subPath].filter(Boolean);
   const fullPath = parts.join('/');
   const url = await graphGetFolderUrl(fullPath);
-  if (url) window.open(url, '_blank');else alert('Folder not found in OneDrive. Create the project folders first from the project page.');
+  if (!url) {
+    alert('Folder not found in OneDrive. Create the project folders first.');
+    return;
+  }
+
+  const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const localBase = getLocalProjectsPath();
+
+  if (isMobile) {
+    // On mobile — OneDrive app intercepts onedrive.live.com links automatically
+    window.open(url, '_blank');
+    return;
+  }
+
+  if (localBase) {
+    // If user set their local OneDrive path in Settings, construct a file:// link
+    // that opens directly in Windows Explorer
+    const localPath = [localBase, projectFolder, subPath].filter(Boolean).join('\\');
+    const fileUrl = 'file:///' + localPath.replace(/\\/g, '/');
+    window.open(fileUrl, '_blank');
+    return;
+  }
+
+  // Fallback — open in OneDrive web (OneDrive desktop app may intercept this)
+  window.open(url, '_blank');
 }
 
 // ─── CONSTANTS ────────────────────────────────────────────────
@@ -3409,7 +3441,8 @@ function SettingsPage({
     savePaths(
       paths.dataFolder || ONEDRIVE_FOLDER_DEFAULT,
       paths.dataFile   || DATA_FILE_DEFAULT,
-      paths.projectsFolder || ONEDRIVE_FOLDER_DEFAULT
+      paths.projectsFolder || ONEDRIVE_FOLDER_DEFAULT,
+      paths.localPath || ''
     );
     alert('Settings saved! Reload the app for path changes to take effect.');
   };
@@ -3566,6 +3599,18 @@ function SettingsPage({
         }),
         /*#__PURE__*/React.createElement("div", {style:{fontSize:10.5,color:'var(--mi)',marginTop:3}},
           "Project folders will be created as: ", (paths.projectsFolder || ONEDRIVE_FOLDER_DEFAULT), " / [project code] — [project name]"
+        )
+      ),
+      /*#__PURE__*/React.createElement("div", {className:"fg"},
+        /*#__PURE__*/React.createElement("label", {className:"fl"}, "Local Windows path — opens folders in Explorer on your PC"),
+        /*#__PURE__*/React.createElement("input", {
+          className:"fi",
+          value: paths.localPath || "",
+          onChange: e => upPath('localPath', e.target.value),
+          placeholder: "e.g. C:\\Users\\USER\\OneDrive\\01-WJ studio\\00-PROJECTS"
+        }),
+        /*#__PURE__*/React.createElement("div", {style:{fontSize:10.5,color:'var(--mi)',marginTop:3}},
+          "Full Windows path to your projects folder. When set, 📁 buttons open directly in Windows Explorer instead of the browser."
         )
       ),
       /*#__PURE__*/React.createElement("div", {className:"alert al-w", style:{marginTop:4,marginBottom:0}},
