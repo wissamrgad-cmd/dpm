@@ -250,17 +250,17 @@ async function graphMkDir(token, fullPath) {
   const url = encodedParent
     ? `${GRAPH}/me/drive/root:/${encodedParent}:/children`
     : `${GRAPH}/me/drive/root/children`;
-  const body = {name: name, folder: {}};
-  body['@microsoft.graph.conflictBehavior'] = 'ignore';
   const res = await fetch(url, {
     method: 'POST',
     headers: {Authorization:`Bearer ${token}`,'Content-Type':'application/json'},
-    body: JSON.stringify(body)
+    body: JSON.stringify({name: name, folder: {}})
   });
-  if (!res.ok && res.status !== 409) {
-    const txt = await res.text().catch(() => '');
-    throw new Error(`Cannot create "${fullPath}": ${res.status} ${txt.slice(0,120)}`);
-  }
+  // 201=created, 200=ok, 409=already exists — all acceptable
+  if (res.ok || res.status === 409) return;
+  // nameAlreadyExists error is also fine
+  const txt = await res.text().catch(() => '');
+  if (txt.includes('nameAlreadyExists') || txt.includes('Name already exists')) return;
+  throw new Error(`Cannot create "${name}": HTTP ${res.status} — ${txt.slice(0,100)}`);
 }
 
 async function createProjectFoldersGraph(project) {
