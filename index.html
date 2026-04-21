@@ -137,23 +137,23 @@ async function getToken() {
 }
 async function graphRead() {
   const token = await getToken();
-  const res = await fetch(`${GRAPH}/me/drive/root:/${encodeURIComponent(getDataFolder())}/${encodeURIComponent(getDataFile())}:/content`, {
-    headers: {
-      Authorization: `Bearer ${token}`
-    }
+  // Build path — encode each segment separately, preserve slashes
+  const folder = getDataFolder().split('/').map(p => encodeURIComponent(p.trim())).join('/');
+  const file   = encodeURIComponent(getDataFile());
+  const res = await fetch(`${GRAPH}/me/drive/root:/${folder}/${file}:/content`, {
+    headers: { Authorization: `Bearer ${token}` }
   });
   if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`Read failed: HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`Read failed: HTTP ${res.status} — check your folder path in Settings`);
   return res.json();
 }
 async function graphWrite(data) {
   const token = await getToken();
-  const res = await fetch(`${GRAPH}/me/drive/root:/${encodeURIComponent(getDataFolder())}/${encodeURIComponent(getDataFile())}:/content`, {
+  const folder = getDataFolder().split('/').map(p => encodeURIComponent(p.trim())).join('/');
+  const file   = encodeURIComponent(getDataFile());
+  const res = await fetch(`${GRAPH}/me/drive/root:/${folder}/${file}:/content`, {
     method: 'PUT',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json'
-    },
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(data, null, 2)
   });
   if (!res.ok) throw new Error(`Write failed: HTTP ${res.status}`);
@@ -162,8 +162,8 @@ async function graphWrite(data) {
 async function graphGetFolderUrl(folderPath) {
   try {
     const token = await getToken();
-    const encoded = encodeURIComponent(folderPath);
-    const res = await fetch(`${GRAPH}/me/drive/root:/${folderPath}`, {
+    const encoded = folderPath.split('/').map(p => encodeURIComponent(p.trim())).join('/');
+    const res = await fetch(`${GRAPH}/me/drive/root:/${encoded}`, {
       headers: {
         Authorization: `Bearer ${token}`
       }
@@ -279,7 +279,7 @@ async function graphMkDir(token, fullPath) {
 
 async function createProjectFoldersGraph(project) {
   const token = await getToken();
-  const base = getProjectsFolder();
+  const base = getProjectsFolder().replace(/\/+$/, ''); // remove trailing slash
   const em = ' — ';
   const pf = project.code + em + project.name;
   const DNAMES = {
@@ -3998,22 +3998,23 @@ function App() {
     try {
       const data = await graphRead();
       if (data && typeof data === 'object') {
-        // Defensive: ensure projects is always an array
         const projs = Array.isArray(data.projects) ? data.projects : [];
-        // Defensive: ensure settings is always a plain object
-        const sett = data.settings && typeof data.settings === 'object' && !Array.isArray(data.settings) ? data.settings : {};
+        const sett  = data.settings && typeof data.settings === 'object' && !Array.isArray(data.settings) ? data.settings : {};
         sProjects(projs);
-        sSettings({
-          ...DEFAULT_SETTINGS,
-          ...sett
-        });
+        sSettings({...DEFAULT_SETTINGS, ...sett});
+        sSaveStatus('saved');
+        setTimeout(() => sSaveStatus('idle'), 2000);
+      } else {
+        // File not found (404) — new location, write a fresh file
+        console.log('DPM: No data file found at', getDataFolder()+'/'+getDataFile(), '— creating new one');
+        await graphWrite({projects:[], settings, lastSaved:new Date().toISOString(), version:'4.0.0'});
+        sSaveStatus('saved');
+        setTimeout(() => sSaveStatus('idle'), 2000);
       }
-      sSaveStatus('saved');
-      setTimeout(() => sSaveStatus('idle'), 2000);
     } catch (e) {
       console.warn('Load failed:', e.message);
       sSaveStatus('error');
-      setTimeout(() => sSaveStatus('idle'), 3000);
+      setTimeout(() => sSaveStatus('idle'), 5000);
     }
     isFirst.current = false;
   };
