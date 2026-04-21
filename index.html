@@ -85,9 +85,20 @@ const DATA_FILE_DEFAULT = 'DPM-Data.json';
 const ONEDRIVE_FOLDER_DEFAULT = 'DPM App';
 
 // Dynamic path helpers — read from localStorage so they work before full app load
-function getDataFolder()    { try{const s=JSON.parse(localStorage.getItem('dpm_paths')||'{}');return s.dataFolder||ONEDRIVE_FOLDER_DEFAULT;}catch{return ONEDRIVE_FOLDER_DEFAULT;} }
+function cleanPath(p) {
+  if(!p) return '';
+  // Strip Windows full path prefix (C:\Users\...\OneDrive\ or similar)
+  p = p.replace(/^[A-Za-z]:\\.*?OneDrive[^\\]*\\/i, '');
+  p = p.replace(/^[A-Za-z]:\\.*?OneDrive[^/]*/i, '');
+  // Convert backslashes to forward slashes
+  p = p.replace(/\\/g, '/');
+  // Remove leading/trailing slashes
+  p = p.replace(/^\/+|\/+$/g, '');
+  return p;
+}
+function getDataFolder()    { try{const s=JSON.parse(localStorage.getItem('dpm_paths')||'{}');return cleanPath(s.dataFolder)||ONEDRIVE_FOLDER_DEFAULT;}catch{return ONEDRIVE_FOLDER_DEFAULT;} }
 function getDataFile()      { try{const s=JSON.parse(localStorage.getItem('dpm_paths')||'{}');return s.dataFile||DATA_FILE_DEFAULT;}catch{return DATA_FILE_DEFAULT;} }
-function getProjectsFolder(){ try{const s=JSON.parse(localStorage.getItem('dpm_paths')||'{}');return s.projectsFolder||ONEDRIVE_FOLDER_DEFAULT;}catch{return ONEDRIVE_FOLDER_DEFAULT;} }
+function getProjectsFolder(){ try{const s=JSON.parse(localStorage.getItem('dpm_paths')||'{}');return cleanPath(s.projectsFolder)||ONEDRIVE_FOLDER_DEFAULT;}catch{return ONEDRIVE_FOLDER_DEFAULT;} }
 function savePaths(dataFolder, dataFile, projectsFolder){ localStorage.setItem('dpm_paths',JSON.stringify({dataFolder,dataFile,projectsFolder})); }
 
 const msalConfig = {
@@ -3555,7 +3566,7 @@ function SettingsPage({
           className:"fi",
           value: paths.dataFolder || ONEDRIVE_FOLDER_DEFAULT,
           onChange: e => upPath('dataFolder', e.target.value),
-          placeholder: "e.g. 02-WJ-Contracting/WJ Apps/PDM"
+          placeholder: "e.g. 00-WJ Apps/DPM APP"
         }),
         /*#__PURE__*/React.createElement("div", {style:{fontSize:10.5,color:'var(--mi)',marginTop:3}},
           "Current: ", paths.dataFolder || ONEDRIVE_FOLDER_DEFAULT, " / ", paths.dataFile || DATA_FILE_DEFAULT
@@ -3576,7 +3587,7 @@ function SettingsPage({
           className:"fi",
           value: paths.projectsFolder || ONEDRIVE_FOLDER_DEFAULT,
           onChange: e => upPath('projectsFolder', e.target.value),
-          placeholder: "e.g. 02-WJ-Contracting/WJ Apps/PDM/Projects"
+          placeholder: "e.g. 01-WJ studio/00-PROJECTS"
         }),
         /*#__PURE__*/React.createElement("div", {style:{fontSize:10.5,color:'var(--mi)',marginTop:3}},
           "Project folders will be created as: ", (paths.projectsFolder || ONEDRIVE_FOLDER_DEFAULT), " / [project code] — [project name]"
