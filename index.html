@@ -180,63 +180,84 @@ async function graphGetUserInfo() {
   return res.json();
 }
 
-// Create OneDrive folder via Graph API
-async function graphCreateFolder(folderPath){
-  try{
-    const token=await getToken();
-    // Split path and create each level
-    const parts=folderPath.split('/').filter(Boolean);
-    let currentPath='';
-    for(const part of parts){
-      currentPath=currentPath?currentPath+'/'+part:part;
-      const res=await fetch(`${GRAPH}/me/drive/root:/${currentPath}`,{
-        headers:{Authorization:`Bearer ${token}`}
-      });
-      if(res.status===404){
-        // Create this folder
-        const parentPath=currentPath.substring(0,currentPath.lastIndexOf('/'));
-        const folderName=part;
-        const createUrl=parentPath
-          ?`${GRAPH}/me/drive/root:/${parentPath}:/children`
-          :`${GRAPH}/me/drive/root/children`;
-        await fetch(createUrl,{
-          method:'POST',
-          headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},
-          body:JSON.stringify({name:folderName,folder:{},'@microsoft.graph.conflictBehavior':'ignore'})
-        });
+// ─── GRAPH API FOLDER CREATION ─────────────────────────────
+async function graphMkDir(token, parentPath, folderName) {
+  // parentPath is the path of the parent folder (empty string = OneDrive root)
+  const url = parentPath ? `${GRAPH}/me/drive/root:/${parentPath}:/children` : `${GRAPH}/me/drive/root/children`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      name: folderName,
+      folder: {},
+      "@microsoft.graph.conflictBehavior": "ignore"
+    })
+  });
+  // 201=created, 200=ok, 409=conflict(already exists) — all acceptable
+  if (!res.ok && res.status !== 409) {
+    const txt = await res.text().catch(() => '');
+    console.warn('graphMkDir issue:', parentPath + '/' + folderName, res.status, txt.slice(0, 80));
+  }
+  return true;
+}
+async function createProjectFoldersGraph(project) {
+  let token;
+  try {
+    token = await getToken();
+  } catch (e) {
+    console.warn('Cannot create folders - not authenticated');
+    return false;
+  }
+  const base = ONEDRIVE_FOLDER; // 'DPM App'
+  const sep = ' — ';
+  const pf = project.code + sep + project.name; // e.g. '2501-WJ — Villa Al-Noor'
+  const DISC_NAMES = {
+    ARC: 'ARC — Architectural',
+    ID: 'ID — Interior Design',
+    LS: 'LS — Landscape',
+    AL: 'AL — Arch. Lighting'
+  };
+  const DISC_SUBS = ['Concept Development', 'Schematic Design', 'Schematic Design/Zoning Analysis', 'Schematic Design/Pre-Plans', 'Schematic Design/3D Visuals', 'Drawings', 'Drawings/General', 'Drawings/GA - Drawings', 'Drawings/Elevations', 'Drawings/Details', 'Drawings/Schedules', 'Specs', 'BOQ', '3D Visuals'];
+  try {
+    // Root app folder
+    await graphMkDir(token, '', base);
+    // Project folder
+    await graphMkDir(token, base, pf);
+    // General folder + subfolders
+    const genPath = base + '/' + pf;
+    await graphMkDir(token, genPath, '1-General');
+    for (const sub of ['Contract', 'Site-Photos', 'Requirements', 'MOM', 'Others']) {
+      await graphMkDir(token, genPath + '/1-General', sub);
+    }
+    // Discipline folders
+    for (const disc of project.disciplines || []) {
+      const dn = DISC_NAMES[disc] || disc;
+      await graphMkDir(token, genPath, dn);
+      const discPath = genPath + '/' + dn;
+      // Create each sub path — must create parents before children
+      const created = new Set();
+      for (const subPath of DISC_SUBS) {
+        const parts = subPath.split('/');
+        let cur = discPath;
+        for (const part of parts) {
+          const key = cur + '/' + part;
+          if (!created.has(key)) {
+            await graphMkDir(token, cur, part);
+            created.add(key);
+          }
+          cur = key;
+        }
       }
     }
+    console.log('DPM: All folders created for', project.code);
     return true;
-  }catch(e){console.warn('graphCreateFolder failed:',e.message);return false;}
-}
-
-// Create all project folders on OneDrive via Graph API
-async function createProjectFoldersGraph(project){
-  const base=ONEDRIVE_FOLDER;
-  const pf=`${project.code} \u2014 ${project.name}`;
-  const DISC_NAMES={ARC:"ARC \u2014 Architectural",ID:"ID \u2014 Interior Design",LS:"LS \u2014 Landscape",AL:"AL \u2014 Arch. Lighting"};
-  const DISC_SUBS=["Concept Development","Schematic Design","Schematic Design/Zoning Analysis","Schematic Design/Pre-Plans","Schematic Design/3D Visuals","Drawings","Drawings/General","Drawings/GA - Drawings","Drawings/Elevations","Drawings/Details","Drawings/Schedules","Specs","BOQ","3D Visuals"];
-  const paths=[
-    `${base}/${pf}`,
-    `${base}/${pf}/1-General`,
-    `${base}/${pf}/1-General/Contract`,
-    `${base}/${pf}/1-General/Site-Photos`,
-    `${base}/${pf}/1-General/Requirements`,
-    `${base}/${pf}/1-General/MOM`,
-    `${base}/${pf}/1-General/Others`,
-  ];
-  for(const disc of(project.disciplines||[])){
-    const dn=DISC_NAMES[disc]||disc;
-    for(const sub of DISC_SUBS){
-      paths.push(`${base}/${pf}/${dn}/${sub}`);
-    }
+  } catch (e) {
+    console.error('createProjectFoldersGraph failed:', e.message);
+    return false;
   }
-  let ok=true;
-  for(const path of paths){
-    const r=await graphCreateFolder(path);
-    if(!r)ok=false;
-  }
-  return ok;
 }
 
 // Open OneDrive folder in browser (works on mobile and desktop)
@@ -938,13 +959,17 @@ function NewProjModal({
         feeFile: null
       }
     };
+    // Save project data and close modal immediately
     onSave(proj);
     onClose();
     // Create OneDrive folders via Graph API after modal closes
-    setTimeout(async()=>{
-      try{ await createProjectFoldersGraph(proj); }
-      catch(e){ console.warn('Folder creation failed (project saved):', e.message); }
-    }, 500);
+    setTimeout(async () => {
+      try {
+        await createProjectFoldersGraph(proj);
+      } catch (e) {
+        console.warn('DPM folder creation failed (project already saved):', e.message);
+      }
+    }, 400);
   };
   return /*#__PURE__*/React.createElement(Modal, {
     title: step === 1 ? "New Project — Details" : "New Project — Confirm",
@@ -3183,6 +3208,7 @@ function GlobalTrans({
 function ArchivedView({
   projects,
   onRestore,
+  onDelete,
   onOpen
 }) {
   const arch = projects.filter(p => p.status === 'archived');
@@ -3202,7 +3228,7 @@ function ArchivedView({
       fontSize: 11.5,
       marginTop: 6
     }
-  }, "Archive projects from their detail page"));
+  }, "Archive completed projects from their detail page"));
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     className: "arch-banner",
     style: {
@@ -3215,8 +3241,8 @@ function ArchivedView({
   }, "\uD83D\uDCE6"), /*#__PURE__*/React.createElement("p", null, "All data preserved. OneDrive folders untouched. Restore any time.")), /*#__PURE__*/React.createElement("div", {
     className: "g3"
   }, arch.map(p => {
-    const pct = calcP(p.phases);
     const drw = Object.values(p.lod || {}).flatMap(d => d.drawings || []);
+    const done = drw.filter(d => d.status === 'approved').length;
     return /*#__PURE__*/React.createElement("div", {
       key: p.id,
       className: "pc pc-archived",
@@ -3251,19 +3277,39 @@ function ArchivedView({
       className: "pc-cl"
     }, p.client), /*#__PURE__*/React.createElement("div", {
       style: {
-        marginTop: 8
+        marginTop: 6,
+        fontSize: 10,
+        color: 'var(--sl)'
+      }
+    }, drw.length, " drawings \xB7 ", done, " approved \xB7 Archived ", p.archivedAt ? new Date(p.archivedAt).toLocaleDateString() : ''), /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginTop: 9,
+        display: 'flex',
+        gap: 6
       }
     }, /*#__PURE__*/React.createElement("button", {
       className: "btn btn-ok btn-sm",
       style: {
-        width: '100%',
+        flex: 1,
         justifyContent: 'center'
       },
       onClick: e => {
         e.stopPropagation();
         onRestore(p.id);
       }
-    }, "\u21A9 Restore"))));
+    }, "\u21A9 Restore"), /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-danger btn-sm",
+      style: {
+        justifyContent: 'center'
+      },
+      title: "Delete from DPM permanently",
+      onClick: e => {
+        e.stopPropagation();
+        if (window.confirm('Delete project from DPM? OneDrive folders are NOT deleted.')) {
+          onDelete(p.id);
+        }
+      }
+    }, " Del"))));
   })));
 }
 
@@ -4205,6 +4251,7 @@ function App() {
       status: 'active',
       archivedAt: null
     }),
+    onDelete: id => sProjects(ps => ps.filter(p => p.id !== id)),
     onOpen: id => {
       sProjId(id);
       sView('project');
