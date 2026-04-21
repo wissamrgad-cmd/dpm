@@ -12,13 +12,26 @@
 <link rel="manifest" href="manifest.json"/>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=IM+Fell+English:ital@0;1&family=Jost:wght@300;400;500;600&display=swap" rel="stylesheet"/>
-<!-- MSAL for Microsoft Sign-In — using unpkg CDN -->
-<script src="https://unpkg.com/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"></script>
+<!-- MSAL — loaded dynamically to guarantee it's ready before app starts -->
 <script>
-// Safety check — if msal didn't load from unpkg, try Microsoft CDN
-if(typeof msal === 'undefined'){
-  document.write('<script src="https://alcdn.msauth.net/browser/2.38.0/js/msal-browser.min.js"><\/script>');
-}
+window.__msalReady = new Promise(function(resolve, reject){
+  function tryLoad(urls, idx){
+    if(idx >= urls.length){ reject(new Error('All MSAL CDNs failed')); return; }
+    var s = document.createElement('script');
+    s.src = urls[idx];
+    s.onload = function(){
+      if(typeof msal !== 'undefined'){ resolve(); }
+      else { tryLoad(urls, idx+1); }
+    };
+    s.onerror = function(){ tryLoad(urls, idx+1); };
+    document.head.appendChild(s);
+  }
+  tryLoad([
+    'https://unpkg.com/@azure/msal-browser@2.38.3/lib/msal-browser.min.js',
+    'https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.3/lib/msal-browser.min.js',
+    'https://alcdn.msauth.net/browser/2.38.0/js/msal-browser.min.js'
+  ], 0);
+});
 </script>
 <!-- React -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
@@ -72,18 +85,17 @@ const msalConfig={
 };
 const loginScopes={scopes:['Files.ReadWrite','User.Read']};
 let msalInstance=null;
-function initMsal(){
+async function initMsal(){
   try{
-    if(typeof msal==='undefined') throw new Error('MSAL library not loaded');
+    await window.__msalReady;
+    if(typeof msal==='undefined') throw new Error('MSAL not available after load');
     msalInstance=new msal.PublicClientApplication(msalConfig);
     return true;
   }catch(e){
-    console.error('MSAL init failed:',e);
+    console.error('MSAL init failed:',e.message);
     return false;
   }
 }
-// Try immediately, will retry in App component if needed
-initMsal();
 
 async function getToken(){
   if(!msalInstance) throw new Error('Auth not available');
@@ -761,9 +773,13 @@ function App(){
 
   // Check auth on load
   useEffect(()=>{(async()=>{
-    // Retry MSAL init in case library loaded after initial attempt
-    if(!msalInstance) initMsal();
-    if(!msalInstance){sAuthState('signed-out');return;}
+    // Wait for MSAL library to load from CDN
+    const ok = await initMsal();
+    if(!ok){
+      sAuthState('signed-out');
+      sAuthError('Could not load Microsoft authentication library. Check your internet connection and refresh.');
+      return;
+    }
     try{
       await msalInstance.handleRedirectPromise();
       const accounts=msalInstance.getAllAccounts();
@@ -779,6 +795,7 @@ function App(){
 
   const signIn=async()=>{
     sAuthState('checking');sAuthError(null);
+    if(!msalInstance){ const ok=await initMsal(); if(!ok){sAuthState('signed-out');sAuthError('Authentication library failed to load. Please refresh the page.');return;} }
     try{
       const result=await msalInstance.loginPopup(loginScopes);
       if(result){sAuthState('signed-in');loadData();graphGetUserInfo().then(info=>{if(info)sUserInfo(info);}).catch(()=>{});}
