@@ -1,0 +1,4447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<meta name="mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="apple-mobile-web-app-title" content="DPM"/>
+<meta name="theme-color" content="#1A1818"/>
+<title>DPM — Design Project Manager</title>
+<link rel="manifest" href="manifest.json"/>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=IM+Fell+English:ital@0;1&family=Jost:wght@300;400;500;600&display=swap" rel="stylesheet"/>
+<!-- MSAL — loaded dynamically to guarantee it's ready before app starts -->
+<script>
+window.__msalReady = new Promise(function(resolve, reject){
+  function tryLoad(urls, idx){
+    if(idx >= urls.length){ reject(new Error('All MSAL CDNs failed')); return; }
+    var s = document.createElement('script');
+    s.src = urls[idx];
+    s.onload = function(){
+      if(typeof msal !== 'undefined'){ resolve(); }
+      else { tryLoad(urls, idx+1); }
+    };
+    s.onerror = function(){ tryLoad(urls, idx+1); };
+    document.head.appendChild(s);
+  }
+  tryLoad([
+    'https://unpkg.com/@azure/msal-browser@2.38.3/lib/msal-browser.min.js',
+    'https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.3/lib/msal-browser.min.js',
+    'https://alcdn.msauth.net/browser/2.38.0/js/msal-browser.min.js'
+  ], 0);
+});
+</script>
+<!-- React -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<style>
+html,body,#root{height:100%;margin:0;padding:0;}
+#loading{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:#F5F3F0;font-family:'Jost',sans-serif;color:#7A7876;gap:14px;}
+#loading .spin{width:28px;height:28px;border:2px solid #D4CFC9;border-top-color:#9E9690;border-radius:50%;animation:spin .8s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg);}}
+</style>
+</head>
+<body>
+<div id="loading"><div class="spin"></div><span style="font-size:11px;letter-spacing:3px;font-weight:500">LOADING DPM</span></div>
+<div id="root" style="display:none;height:100%"></div>
+
+<!-- Global crash recovery -->
+<script>
+window.__dpmInstallEvt=null;
+window.addEventListener('beforeinstallprompt',function(e){e.preventDefault();window.__dpmInstallEvt=e;if(typeof window.__dpmOnInstallReady==='function')window.__dpmOnInstallReady(e);});
+window.addEventListener('appinstalled',function(){window.__dpmInstallEvt=null;if(typeof window.__dpmOnInstalled==='function')window.__dpmOnInstalled();});
+window.onerror=function(msg,src,line,col,err){
+  var el=document.getElementById('root');if(!el)return true;
+  el.style.display='block';document.getElementById('loading').style.display='none';
+  el.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100vh;background:#F5F3F0;font-family:Jost,sans-serif;"><div style="background:white;border:1px solid #D4CFC9;border-radius:8px;padding:36px;max-width:440px;width:100%;text-align:center;"><div style="font-size:36px;margin-bottom:12px">⚠️</div><div style="font-family:Georgia,serif;font-size:20px;margin-bottom:8px">Something went wrong</div><p style="font-size:12px;color:#7A7876;margin-bottom:16px;line-height:1.7">Your data is safe. Click Reload to continue.</p><div style="background:#FFF3E0;border:1px solid #FFE0B2;border-radius:4px;padding:8px 12px;font-size:11px;color:#E65100;margin-bottom:18px;text-align:left"><strong>Error:</strong> '+(msg||'Unknown')+'</div><button onclick="window.location.reload()" style="background:#1A1818;color:white;border:none;padding:12px 28px;border-radius:4px;font-size:13px;cursor:pointer;width:100%;font-family:Jost,sans-serif;">↺ Reload DPM</button></div></div>';
+  return true;
+};
+window.onunhandledrejection=function(e){
+  var msg=e.reason?(e.reason.message||String(e.reason)):'Async error';
+  if(document.getElementById('root')&&document.getElementById('root').style.display!=='none')
+    window.onerror(msg);
+  e.preventDefault();
+};
+</script>
+
+<script>
+const {
+  useState,
+  useEffect,
+  useRef,
+  useMemo,
+  useCallback
+} = React;
+
+// ════════════════════════════════════════════════════════════════
+// MICROSOFT GRAPH API — OneDrive Sync
+// ════════════════════════════════════════════════════════════════
+const CLIENT_ID = '5f29117c-b706-4fc6-8142-5d6f5e728741';
+const REDIRECT = 'https://wissamrgad-cmd.github.io/dpm/';
+const GRAPH = 'https://graph.microsoft.com/v1.0';
+const DATA_FILE_DEFAULT = 'DPM-Data.json';
+const ONEDRIVE_FOLDER_DEFAULT = 'DPM App';
+
+// Dynamic path helpers — read from localStorage so they work before full app load
+function cleanPath(p) {
+  if(!p) return '';
+  // Strip Windows full path prefix (C:\Users\...\OneDrive\ or similar)
+  p = p.replace(/^[A-Za-z]:\\.*?OneDrive[^\\]*\\/i, '');
+  p = p.replace(/^[A-Za-z]:\\.*?OneDrive[^/]*/i, '');
+  // Convert backslashes to forward slashes
+  p = p.replace(/\\/g, '/');
+  // Remove leading/trailing slashes
+  p = p.replace(/^\/+|\/+$/g, '');
+  return p;
+}
+function getDataFolder()    { try{const s=JSON.parse(localStorage.getItem('dpm_paths')||'{}');return cleanPath(s.dataFolder)||ONEDRIVE_FOLDER_DEFAULT;}catch{return ONEDRIVE_FOLDER_DEFAULT;} }
+function getDataFile()      { try{const s=JSON.parse(localStorage.getItem('dpm_paths')||'{}');return s.dataFile||DATA_FILE_DEFAULT;}catch{return DATA_FILE_DEFAULT;} }
+function getProjectsFolder(){ try{const s=JSON.parse(localStorage.getItem('dpm_paths')||'{}');return cleanPath(s.projectsFolder)||ONEDRIVE_FOLDER_DEFAULT;}catch{return ONEDRIVE_FOLDER_DEFAULT;} }
+function savePaths(dataFolder, dataFile, projectsFolder, localPath){ localStorage.setItem('dpm_paths',JSON.stringify({dataFolder,dataFile,projectsFolder,localPath})); }
+
+const msalConfig = {
+  auth: {
+    clientId: CLIENT_ID,
+    authority: 'https://login.microsoftonline.com/consumers',
+    redirectUri: REDIRECT
+  },
+  cache: {
+    cacheLocation: 'localStorage',
+    storeAuthStateInCookie: false
+  }
+};
+const LOGIN_SCOPES = ['Files.ReadWrite', 'User.Read'];
+const loginScopes = {
+  scopes: LOGIN_SCOPES
+};
+let msalInstance = null;
+async function initMsal() {
+  try {
+    await window.__msalReady;
+    if (typeof msal === 'undefined') throw new Error('MSAL not available after load');
+    msalInstance = new msal.PublicClientApplication(msalConfig);
+    return true;
+  } catch (e) {
+    console.error('MSAL init failed:', e.message);
+    return false;
+  }
+}
+async function getToken() {
+  if (!msalInstance) throw new Error('Auth not available');
+  const accounts = msalInstance.getAllAccounts();
+  if (!accounts || !accounts.length) throw new Error('Not signed in');
+  try {
+    // Avoid spreading loginScopes — build request object explicitly
+    const r = await msalInstance.acquireTokenSilent({
+      scopes: LOGIN_SCOPES,
+      account: accounts[0]
+    });
+    return r.accessToken;
+  } catch (e) {
+    const r = await msalInstance.acquireTokenPopup({
+      scopes: LOGIN_SCOPES
+    });
+    return r.accessToken;
+  }
+}
+async function graphRead() {
+  const token = await getToken();
+  // Build path — encode each segment separately, preserve slashes
+  const folder = getDataFolder().split('/').map(p => encodeURIComponent(p.trim())).join('/');
+  const file   = encodeURIComponent(getDataFile());
+  const res = await fetch(`${GRAPH}/me/drive/root:/${folder}/${file}:/content`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Read failed: HTTP ${res.status} — check your folder path in Settings`);
+  return res.json();
+}
+async function graphWrite(data) {
+  const token = await getToken();
+  const folder = getDataFolder().split('/').map(p => encodeURIComponent(p.trim())).join('/');
+  const file   = encodeURIComponent(getDataFile());
+  const res = await fetch(`${GRAPH}/me/drive/root:/${folder}/${file}:/content`, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(data, null, 2)
+  });
+  if (!res.ok) throw new Error(`Write failed: HTTP ${res.status}`);
+  return true;
+}
+async function graphGetFolderUrl(folderPath) {
+  try {
+    const token = await getToken();
+    const encoded = folderPath.split('/').map(p => encodeURIComponent(p.trim())).join('/');
+    const res = await fetch(`${GRAPH}/me/drive/root:/${encoded}`, {
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    });
+    if (!res.ok) return null;
+    const d = await res.json();
+    return d.webUrl || null;
+  } catch (e) {
+    return null;
+  }
+}
+async function graphGetUserInfo() {
+  const token = await getToken();
+  const res = await fetch(`${GRAPH}/me`, {
+    headers: {
+      Authorization: `Bearer ${token}`
+    }
+  });
+  if (!res.ok) return null;
+  return res.json();
+}
+
+// ─── GRAPH API FOLDER CREATION ─────────────────────────────
+// Create Folders button — for existing projects
+function CreateFoldersBtn({project}) {
+  const [status, setStatus] = React.useState('idle');
+  const [errorMsg, setErrorMsg] = React.useState('');
+  const create = async e => {
+    e.stopPropagation();
+    setStatus('creating');
+    setErrorMsg('');
+    try {
+      await createProjectFoldersGraph(project);
+      setStatus('done');
+      setTimeout(() => setStatus('idle'), 6000);
+    } catch(err) {
+      console.error('Create folders error:', err.message);
+      setErrorMsg(err.message);
+      setStatus('error');
+      setTimeout(() => { setStatus('idle'); setErrorMsg(''); }, 8000);
+    }
+  };
+  const cfg = {
+    idle:     {label:'📁 Create Folders', cls:'btn btn-g btn-sm', disabled:false},
+    creating: {label:'⏳ Creating folders…', cls:'btn btn-g btn-sm', disabled:true},
+    done:     {label:'✓ Created in DPM App folder!', cls:'btn btn-ok btn-sm', disabled:true},
+    error:    {label:'✗ Failed — see details below', cls:'btn btn-danger btn-sm', disabled:false},
+  };
+  const c = cfg[status] || cfg.idle;
+  return React.createElement(React.Fragment, null,
+    React.createElement('button', {
+      className: c.cls,
+      onClick: create,
+      disabled: c.disabled,
+      title: 'Creates folder structure in OneDrive: DPM App / ' + project.code + ' — ' + project.name
+    }, c.label),
+    status === 'done' && React.createElement('div', {
+      style:{fontSize:10.5,color:'#2e7d32',marginTop:4,marginBottom:4}
+    }, 'Look in your OneDrive for folder: DPM App / ' + project.code + ' — ' + project.name),
+    status === 'error' && React.createElement('div', {
+      style:{fontSize:10.5,color:'#c62828',marginTop:4,marginBottom:4}
+    }, errorMsg || 'Failed. Open DevTools (F12) → Console to see the error.')
+  );
+}
+
+// Create a single folder using PUT — most reliable Graph API method
+// Creates folder at the full path, works even if intermediate folders missing
+async function graphMkDir(token, fullPath) {
+  const parts = fullPath.split('/');
+  const name = parts[parts.length - 1];
+  const parentParts = parts.slice(0, -1);
+  const encodedParent = parentParts.map(p => encodeURIComponent(p.trim())).join('/');
+  const url = encodedParent
+    ? `${GRAPH}/me/drive/root:/${encodedParent}:/children`
+    : `${GRAPH}/me/drive/root/children`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {Authorization:`Bearer ${token}`,'Content-Type':'application/json'},
+    body: JSON.stringify({name: name, folder: {}})
+  });
+  // 201=created, 200=ok, 409=already exists — all acceptable
+  if (res.ok || res.status === 409) return;
+  // nameAlreadyExists error is also fine
+  const txt = await res.text().catch(() => '');
+  if (txt.includes('nameAlreadyExists') || txt.includes('Name already exists')) return;
+  throw new Error(`Cannot create "${name}": HTTP ${res.status} — ${txt.slice(0,100)}`);
+}
+
+async function createProjectFoldersGraph(project) {
+  const token = await getToken();
+  const base = getProjectsFolder().replace(/\/+$/, ''); // remove trailing slash
+  const em = ' — ';
+  const pf = project.code + em + project.name;
+  const DNAMES = {
+    ARC: 'ARC — Architectural',
+    ID: 'ID — Interior Design',
+    LS: 'LS — Landscape',
+    AL: 'AL — Arch. Lighting'
+  };
+
+  // Build complete list of paths to create, parents always before children
+  const paths = [
+    base,
+    `${base}/${pf}`,
+    `${base}/${pf}/1-General`,
+    `${base}/${pf}/1-General/Contract`,
+    `${base}/${pf}/1-General/Site-Photos`,
+    `${base}/${pf}/1-General/Requirements`,
+    `${base}/${pf}/1-General/MOM`,
+    `${base}/${pf}/1-General/Others`,
+  ];
+
+  for (const disc of (project.disciplines || [])) {
+    const dn = DNAMES[disc] || disc;
+    const dp = `${base}/${pf}/${dn}`;
+    paths.push(
+      dp,
+      `${dp}/Concept Development`,
+      `${dp}/Schematic Design`,
+      `${dp}/Schematic Design/Zoning Analysis`,
+      `${dp}/Schematic Design/Pre-Plans`,
+      `${dp}/Schematic Design/3D Visuals`,
+      `${dp}/Drawings`,
+      `${dp}/Drawings/General`,
+      `${dp}/Drawings/GA - Drawings`,
+      `${dp}/Drawings/Elevations`,
+      `${dp}/Drawings/Details`,
+      `${dp}/Drawings/Schedules`,
+      `${dp}/Specs`,
+      `${dp}/BOQ`,
+      `${dp}/3D Visuals`
+    );
+  }
+
+  console.log('DPM: Creating', paths.length, 'folders for', project.code);
+  let errors = 0;
+  for (const path of paths) {
+    try {
+      await graphMkDir(token, path);
+    } catch (e) {
+      console.error('DPM folder failed:', e.message);
+      errors++;
+    }
+  }
+
+  if (errors > 0) {
+    throw new Error(`${errors} folders failed to create. Check console for details.`);
+  }
+  console.log('DPM: All folders created for', project.code, 'in OneDrive:', base);
+  return true;
+}
+
+// Open OneDrive folder in browser (works on mobile and desktop)
+// Get local Windows path to OneDrive folder
+function getLocalProjectsPath() {
+  try {
+    const s = JSON.parse(localStorage.getItem('dpm_paths') || '{}');
+    return (s.localPath || '').trim().replace(/[/\\]+$/, '');
+  } catch { return ''; }
+}
+
+async function openOneDriveFolder(project, settings, subPath) {
+  const base = getProjectsFolder();
+  const projectFolder = `${project.code} \u2014 ${project.name}`;
+  const parts = [base, projectFolder, subPath].filter(Boolean);
+  const fullPath = parts.join('/');
+  const url = await graphGetFolderUrl(fullPath);
+  if (!url) {
+    alert('Folder not found in OneDrive. Create the project folders first.');
+    return;
+  }
+
+  const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const localBase = getLocalProjectsPath();
+
+  if (isMobile) {
+    // On mobile — OneDrive app intercepts onedrive.live.com links automatically
+    window.open(url, '_blank');
+    return;
+  }
+
+  if (localBase) {
+    // If user set their local OneDrive path in Settings, construct a file:// link
+    // that opens directly in Windows Explorer
+    const localPath = [localBase, projectFolder, subPath].filter(Boolean).join('\\');
+    const fileUrl = 'file:///' + localPath.replace(/\\/g, '/');
+    window.open(fileUrl, '_blank');
+    return;
+  }
+
+  // Fallback — open in OneDrive web (OneDrive desktop app may intercept this)
+  window.open(url, '_blank');
+}
+
+// ─── CONSTANTS ────────────────────────────────────────────────
+const APP_VERSION = '4.0.0';
+const CSS = `
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+:root{--bk:#1A1818;--dk:#2E2C2B;--ch:#3D3B3B;--mi:#7A7876;--sl:#A8A5A1;--lt:#C4C0BC;--bg:#EAE6E1;--bd:#D4CFC9;--wm:#F5F3F0;--wh:#FFFFFF;--ac:#9E9690;--ad:#6B6763;--fh:'IM Fell English',Georgia,serif;--fb:'Jost','Segoe UI',sans-serif;--r:4px;--rl:8px;--sh:0 2px 12px rgba(0,0,0,.07);--shl:0 4px 24px rgba(0,0,0,.11);}
+body{font-family:var(--fb);background:var(--wm);color:var(--bk);font-size:13px;}
+.app{display:flex;height:100vh;overflow:hidden;}
+
+/* SIGN IN SCREEN */
+.signin{display:flex;align-items:center;justify-content:center;height:100vh;background:var(--bk);}
+.signin-card{background:var(--wh);border-radius:12px;padding:44px;max-width:420px;width:100%;margin:16px;text-align:center;box-shadow:0 24px 60px rgba(0,0,0,.4);}
+.ms-btn{background:#0078D4;color:white;border:none;padding:13px 24px;border-radius:6px;font-size:13.5px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:10px;width:100%;justify-content:center;margin-top:4px;transition:background .15s;}
+.ms-btn:hover{background:#006BBD;}
+.ms-logo{width:20px;height:20px;flex-shrink:0;}
+
+/* SAVE STATUS */
+.ss{display:flex;align-items:center;gap:6px;font-size:10.5px;font-weight:500;padding:3px 10px;border-radius:10px;}
+.ss-saving{background:#fff3e0;color:#e65100;}.ss-saved{background:#e8f5e9;color:#2e7d32;}.ss-error{background:#ffebee;color:#c62828;}.ss-syncing{background:#e3f2fd;color:#1565c0;}
+
+/* SIDEBAR */
+.sb{width:224px;min-width:224px;background:var(--bk);display:flex;flex-direction:column;z-index:100;}
+.sb-logo{padding:18px 16px 12px;border-bottom:1px solid #252323;}
+.sb-logo-img{max-width:100%;max-height:44px;object-fit:contain;display:block;}
+.sb-logo-box{border:1px solid var(--ac);padding:5px 9px;display:inline-block;}
+.sb-logo-txt{font-size:9px;font-weight:600;letter-spacing:3px;color:var(--ac);}
+.sb-name{font-family:var(--fh);font-size:13px;color:var(--wh);margin-top:5px;line-height:1.25;}
+.sb-user{font-size:9px;color:var(--ad);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.nav{flex:1;padding:10px 0;overflow-y:auto;}
+.nav::-webkit-scrollbar{width:3px;}.nav::-webkit-scrollbar-thumb{background:#2A2828;}
+.ns{padding:0 12px;margin-bottom:4px;}
+.nl{font-size:8px;font-weight:600;letter-spacing:2.5px;color:var(--ad);padding:9px 4px 3px;}
+.ni{display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:var(--r);cursor:pointer;color:var(--sl);font-size:11.5px;transition:all .15s;margin-bottom:1px;white-space:nowrap;overflow:hidden;}
+.ni:hover{background:#2A2828;color:var(--wh);}
+.ni.on{background:var(--ad);color:var(--wh);}
+.ni svg{opacity:.7;flex-shrink:0;}.ni.on svg{opacity:1;}
+.ni-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;}
+.sb-ft{padding:10px 14px;border-top:1px solid #252323;}
+.sb-ft p{font-size:7px;letter-spacing:1.5px;color:#333131;font-weight:500;}
+
+/* MAIN */
+.main{flex:1;overflow-y:auto;display:flex;flex-direction:column;min-width:0;}
+.topbar{background:var(--wh);border-bottom:1px solid var(--bd);padding:0 20px;height:50px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:50;flex-shrink:0;}
+.tb-title{font-family:var(--fh);font-size:18px;color:var(--bk);}
+.content{padding:18px 20px;flex:1;}
+
+/* BUTTONS */
+.btn{display:inline-flex;align-items:center;gap:5px;padding:6px 14px;border-radius:var(--r);font-family:var(--fb);font-size:11px;font-weight:500;cursor:pointer;border:none;transition:all .15s;white-space:nowrap;}
+.btn-p{background:var(--bk);color:var(--wh);}.btn-p:hover{background:var(--ch);}
+.btn-g{background:transparent;color:var(--ch);border:1px solid var(--bd);}.btn-g:hover{background:var(--bg);}
+.btn-a{background:var(--ac);color:var(--wh);}.btn-a:hover{background:var(--ad);}
+.btn-ok{background:#2e7d32;color:var(--wh);}
+.btn-danger{background:#c0392b;color:var(--wh);}
+.btn-sm{padding:4px 10px;font-size:10.5px;}.btn-xs{padding:3px 8px;font-size:10px;}
+
+/* CARDS */
+.card{background:var(--wh);border:1px solid var(--bd);border-radius:var(--rl);box-shadow:var(--sh);}
+.card-hd{padding:12px 16px;border-bottom:1px solid var(--bg);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px;}
+.card-hd h3{font-family:var(--fh);font-size:14px;font-weight:400;}
+.card-bd{padding:14px 16px;}
+.g4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;}
+.g3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;}
+.g2{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;}
+@media(max-width:700px){.g4{grid-template-columns:repeat(2,1fr);}.g3{grid-template-columns:1fr 1fr;}.g2{grid-template-columns:1fr;}}
+.stat{background:var(--wh);border:1px solid var(--bd);border-radius:var(--rl);padding:14px 16px;}
+.stat-v{font-family:var(--fh);font-size:28px;line-height:1;}
+.stat-l{font-size:9px;font-weight:500;letter-spacing:1.5px;color:var(--sl);margin-top:4px;text-transform:uppercase;}
+.stat-s{font-size:11px;color:var(--mi);margin-top:3px;}
+
+/* PROJECT CARDS */
+.pc{background:var(--wh);border:1px solid var(--bd);border-radius:var(--rl);overflow:hidden;cursor:pointer;transition:box-shadow .2s,transform .15s;box-shadow:var(--sh);}
+.pc:hover{box-shadow:var(--shl);transform:translateY(-1px);}
+.pc-top{height:4px;}
+.pc-bd{padding:13px 14px;}
+.pc-code{font-size:8.5px;font-weight:600;letter-spacing:2px;color:var(--sl);}
+.pc-name{font-family:var(--fh);font-size:15px;color:var(--bk);margin:3px 0 2px;line-height:1.2;}
+.pc-cl{font-size:11px;color:var(--mi);margin-bottom:9px;}
+.pb-w{height:3px;background:var(--bg);border-radius:2px;margin-bottom:7px;}
+.pb{height:100%;border-radius:2px;background:var(--ch);transition:width .4s;}
+
+/* BADGE */
+.badge{display:inline-flex;align-items:center;padding:2px 7px;border-radius:2px;font-size:9px;font-weight:600;letter-spacing:.8px;white-space:nowrap;}
+.bn{background:#C4C0BC;color:#3D3B3B;}.bp{background:#A89B93;color:white;}.br{background:#8C7B6E;color:white;}.bc{background:#6B6763;color:white;}.ba{background:#3D3B3B;color:white;}.bs{background:#B5ADA8;color:white;}
+
+/* TABS */
+.tabs{display:flex;gap:0;border-bottom:2px solid var(--bg);margin-bottom:16px;overflow-x:auto;}
+.tabs::-webkit-scrollbar{display:none;}
+.tab{padding:8px 12px;font-size:11px;font-weight:500;color:var(--mi);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;transition:all .15s;white-space:nowrap;flex-shrink:0;}
+.tab:hover{color:var(--ch);}.tab.on{color:var(--bk);border-bottom-color:var(--bk);font-weight:600;}
+
+/* TABLE */
+.tbl{width:100%;border-collapse:collapse;}
+.tbl th{text-align:left;padding:7px 8px;font-size:8px;font-weight:600;letter-spacing:1.5px;color:var(--sl);border-bottom:1px solid var(--bd);text-transform:uppercase;background:var(--wm);}
+.tbl td{padding:7px 8px;font-size:11px;color:var(--ch);border-bottom:1px solid var(--bg);vertical-align:middle;}
+.tbl tr:last-child td{border-bottom:none;}
+.tbl tr:hover td{background:var(--wm);}
+.tbl-cl tr{cursor:pointer;}
+.drn{font-size:10px;font-weight:600;color:var(--ad);letter-spacing:.3px;}
+
+/* FORM */
+.fg{margin-bottom:12px;}
+.fl{display:block;font-size:9.5px;font-weight:600;letter-spacing:1px;color:var(--mi);margin-bottom:4px;text-transform:uppercase;}
+.fi{width:100%;padding:7px 9px;border:1px solid var(--bd);border-radius:var(--r);font-family:var(--fb);font-size:12px;color:var(--bk);background:var(--wh);outline:none;transition:border-color .15s;}
+.fi:focus{border-color:var(--ac);}
+.fs{width:100%;padding:7px 9px;border:1px solid var(--bd);border-radius:var(--r);font-family:var(--fb);font-size:12px;color:var(--bk);background:var(--wh);outline:none;cursor:pointer;}
+.ft{width:100%;padding:7px 9px;border:1px solid var(--bd);border-radius:var(--r);font-family:var(--fb);font-size:12px;color:var(--bk);background:var(--wh);resize:vertical;min-height:60px;outline:none;}
+.fr{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+.fr3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;}
+@media(max-width:600px){.fr,.fr3{grid-template-columns:1fr;}}
+
+/* MODAL */
+.mo{position:fixed;inset:0;background:rgba(26,24,24,.55);z-index:200;display:flex;align-items:center;justify-content:center;padding:12px;}
+.modal{background:var(--wh);border-radius:var(--rl);box-shadow:var(--shl);width:100%;max-width:660px;max-height:92vh;overflow-y:auto;}
+.modal-hd{padding:14px 18px;border-bottom:1px solid var(--bg);display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;background:var(--wh);z-index:1;}
+.modal-hd h2{font-family:var(--fh);font-size:18px;font-weight:400;}
+.modal-bd{padding:16px 18px;}
+.modal-ft{padding:10px 18px;border-top:1px solid var(--bg);display:flex;justify-content:flex-end;gap:8px;background:var(--wm);border-radius:0 0 var(--rl) var(--rl);}
+.xbtn{background:none;border:none;cursor:pointer;color:var(--mi);font-size:20px;line-height:1;}
+
+/* DISCIPLINE */
+.dh{display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:var(--rl) var(--rl) 0 0;color:white;flex-wrap:wrap;gap:8px;}
+.dh-code{font-family:var(--fh);font-size:24px;}
+.lg{border:1px solid var(--bd);border-radius:var(--rl);overflow:hidden;margin-bottom:12px;}
+.lgh{background:var(--ch);color:white;padding:8px 12px;display:flex;align-items:center;justify-content:space-between;}
+.lgh h4{font-size:11px;font-weight:500;}.lgh-r{display:flex;align-items:center;gap:8px;}
+
+/* FILTER */
+.fbar{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:12px;align-items:center;}
+.fchip{padding:3px 9px;border-radius:12px;font-size:9.5px;font-weight:600;cursor:pointer;border:1.5px solid var(--bd);color:var(--mi);transition:all .15s;}
+.fchip:hover{border-color:var(--lt);color:var(--ch);}.fchip.on{border-color:var(--ch);background:var(--ch);color:white;}
+
+/* TAGS */
+.tag{font-size:8px;font-weight:600;letter-spacing:1px;padding:2px 6px;border-radius:2px;}
+.t-arc{background:#3D3B3B;color:white;}.t-id{background:#9E9690;color:white;}.t-ls{background:#6B6763;color:white;}.t-al{background:#7A7876;color:white;}
+
+/* INFO GRID */
+.ig{display:grid;grid-template-columns:1fr 1fr;}
+.iif{padding:8px 12px;border-bottom:1px solid var(--bg);}
+.iif:nth-child(odd){border-right:1px solid var(--bg);}
+.lbl{font-size:8px;font-weight:600;letter-spacing:1.5px;color:var(--sl);text-transform:uppercase;margin-bottom:3px;}
+.val{font-size:12px;color:var(--ch);}
+
+/* REVISION */
+.rev-it{display:flex;gap:10px;align-items:flex-start;margin-bottom:8px;}
+.rev-dot{width:24px;height:24px;border-radius:50%;background:var(--ch);display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;color:white;flex-shrink:0;}
+.rev-dot.cur{background:var(--ac);}
+.rev-cnt{flex:1;padding:5px 9px;background:var(--wm);border-radius:var(--r);border:1px solid var(--bd);}
+
+/* TRANSMITTAL */
+.trm{padding:16px;}
+.trm-hd{border-bottom:3px solid var(--bk);padding-bottom:10px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:flex-start;}
+.trm-title{font-family:var(--fh);font-size:18px;}
+
+/* MISC */
+.alert{padding:9px 12px;border-radius:var(--r);font-size:11.5px;margin-bottom:12px;}
+.al-i{background:var(--bg);border:1px solid var(--bd);color:var(--ch);}
+.al-ok{background:#e8f5e9;border:1px solid #c8e6c9;color:#2e7d32;}
+.al-w{background:#fff3e0;border:1px solid #ffe0b2;color:#e65100;}
+.bc-nav{display:flex;align-items:center;gap:5px;font-size:10px;color:var(--sl);margin-bottom:6px;}
+.bc-nav span{cursor:pointer;}.bc-nav span:hover{color:var(--ch);}
+.set-sec{margin-bottom:20px;}
+.set-sec>h3{font-family:var(--fh);font-size:15px;font-weight:400;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--bg);}
+.ver{font-size:8px;letter-spacing:1px;color:var(--ad);margin-top:2px;}
+.arch-banner{background:#fff8f0;border:1px solid #ffe0b2;border-radius:var(--rl);padding:12px 16px;margin-bottom:14px;display:flex;align-items:center;gap:12px;}
+.arch-banner p{font-size:11.5px;color:#bf360c;flex:1;line-height:1.55;}
+.pc-archived{opacity:.5;filter:grayscale(.6);}
+.disc-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:6px;}
+.disc-opt{border:2px solid var(--bd);border-radius:var(--rl);padding:10px 12px;cursor:pointer;transition:all .2s;display:flex;align-items:center;gap:10px;}
+.disc-opt:hover{border-color:var(--lt);}.disc-opt.sel{border-color:var(--ch);background:var(--wm);}
+.disc-opt-check{width:16px;height:16px;border:2px solid var(--bd);border-radius:3px;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all .2s;}
+.disc-opt.sel .disc-opt-check{background:var(--ch);border-color:var(--ch);}
+.disc-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0;}
+.disc-opt-info h4{font-size:11.5px;font-weight:600;color:var(--bk);}
+.disc-opt-info p{font-size:9.5px;color:var(--mi);margin-top:1px;}
+.folder-tree{background:var(--wm);border:1px solid var(--bd);border-radius:var(--r);padding:10px 12px;font-size:10.5px;color:var(--ch);line-height:1.9;font-family:'Courier New',monospace;max-height:200px;overflow-y:auto;}
+.code-box{background:var(--bk);border-radius:var(--rl);padding:14px 16px;margin-bottom:14px;}
+`;
+const SM = {
+  "not-started": {
+    label: "Not Started",
+    cls: "bn"
+  },
+  "in-progress": {
+    label: "In Progress",
+    cls: "bp"
+  },
+  "under-review": {
+    label: "Under Review",
+    cls: "br"
+  },
+  "client-review": {
+    label: "Client Review",
+    cls: "bc"
+  },
+  "approved": {
+    label: "Approved",
+    cls: "ba"
+  },
+  "superseded": {
+    label: "Superseded",
+    cls: "bs"
+  }
+};
+const SO = ["not-started", "in-progress", "under-review", "client-review", "approved", "superseded"];
+const GRP = {
+  GN: "General Information",
+  GA: "GA Drawings",
+  ELV: "Enlarged Elevations",
+  DTL: "Detailed Drawings",
+  SCH: "Schedules"
+};
+const DC = {
+  ARC: "#3D3B3B",
+  ID: "#9E9690",
+  LS: "#6B6763",
+  AL: "#7A7876"
+};
+const DN = {
+  ARC: "Architectural",
+  ID: "Interior Design",
+  LS: "Landscape",
+  AL: "Arch. Lighting"
+};
+const PHS = ["discovery", "concept", "schematic", "development", "documents", "delivery"];
+const PHL = {
+  discovery: "Discovery & Brief",
+  concept: "Concept Development",
+  schematic: "Schematic Design",
+  development: "Design Development",
+  documents: "Construction Docs",
+  delivery: "Contract Admin"
+};
+const FLOORS = ["GN", "00", "01", "02", "03", "B1", "B2"];
+const PAPERS = ["A0", "A1", "A2", "A3"];
+const DP = {
+  ARC: "A",
+  ID: "I",
+  LS: "L",
+  AL: "AL"
+};
+const DISC_ALL = ["ARC", "ID", "LS", "AL"];
+const DISC_NAMES_FULL = {
+  ARC: "ARC — Architectural",
+  ID: "ID — Interior Design",
+  LS: "LS — Landscape",
+  AL: "AL — Arch. Lighting"
+};
+const GROUP_FOLDER = {
+  GN: "Drawings/General",
+  GA: "Drawings/GA - Drawings",
+  ELV: "Drawings/Elevations",
+  DTL: "Drawings/Details",
+  SCH: "Drawings/Schedules"
+};
+const DISC_FOLDERS = ["Concept Development", "Schematic Design/Zoning Analysis", "Schematic Design/Pre-Plans", "Schematic Design/3D Visuals", "Drawings/General", "Drawings/GA - Drawings", "Drawings/Elevations", "Drawings/Details", "Drawings/Schedules", "Specs", "BOQ", "3D Visuals"];
+
+// ─── DEFAULT DATA ─────────────────────────────────────────────
+function mkD(id, num, title, group) {
+  return {
+    id,
+    num,
+    title,
+    group,
+    rev: "-",
+    status: "not-started",
+    assignee: "-",
+    issueDate: "-",
+    revisions: []
+  };
+}
+const TPL = {
+  ID: ts => [mkD(`gn1${ts}`, "I-A1-GN-001", "Cover Sheet", "GN"), mkD(`gn2${ts}`, "I-A1-GN-002", "Drawing Index", "GN"), mkD(`gn3${ts}`, "I-A1-GN-003", "General Notes & Specifications", "GN"), mkD(`gn4${ts}`, "I-A1-GN-004", "Legend & Abbreviations", "GN"), mkD(`ga1${ts}`, "I-A1-00-101", "General Floor Plan", "GA"), mkD(`ga2${ts}`, "I-A1-00-102", "Demolition Plan", "GA"), mkD(`ga3${ts}`, "I-A1-00-103", "Wall Partitions Plan", "GA"), mkD(`ga4${ts}`, "I-A1-00-104", "Finishes Plan", "GA"), mkD(`ga5${ts}`, "I-A1-00-105", "Flooring Plan", "GA"), mkD(`ga6${ts}`, "I-A1-00-106", "Reflected Ceiling Plan", "GA"), mkD(`ga7${ts}`, "I-A1-00-107", "Lighting Plans", "GA"), mkD(`ga8${ts}`, "I-A1-00-108", "Electrical Plans", "GA"), mkD(`ga9${ts}`, "I-A1-00-109", "FF&E Plan", "GA"), mkD(`ev1${ts}`, "I-A1-00-201", "ID Elevations — Sheet 01", "ELV"), mkD(`ev2${ts}`, "I-A1-00-202", "ID Elevations — Sheet 02", "ELV"), mkD(`dt1${ts}`, "I-A1-JO-301", "Door Types", "DTL"), mkD(`dt2${ts}`, "I-A1-JO-401", "Millwork Details", "DTL"), mkD(`dt3${ts}`, "I-A1-MT-501", "Metalwork Details", "DTL"), mkD(`sc1${ts}`, "I-A1-AZ-SC-701", "Schedule of Finishes", "SCH"), mkD(`sc2${ts}`, "I-A1-AZ-SC-702", "Schedule of Doors", "SCH"), mkD(`sc3${ts}`, "I-A1-AZ-SC-703", "Schedule of Joinery", "SCH"), mkD(`sc4${ts}`, "I-A1-AZ-SC-704", "Schedule of Hardware", "SCH")],
+  ARC: ts => [mkD(`agn1${ts}`, "A-A1-GN-001", "Cover Sheet", "GN"), mkD(`agn2${ts}`, "A-A1-GN-002", "Drawing Index", "GN"), mkD(`agn3${ts}`, "A-A1-GN-003", "General Notes", "GN"), mkD(`agn4${ts}`, "A-A1-GN-004", "Legend & Abbreviations", "GN"), mkD(`aga1${ts}`, "A-A1-00-101", "Site Plan", "GA"), mkD(`aga2${ts}`, "A-A1-00-102", "Ground Floor Plan", "GA"), mkD(`aga3${ts}`, "A-A1-00-103", "First Floor Plan", "GA"), mkD(`aev1${ts}`, "A-A1-00-201", "Elevations — N & S", "ELV"), mkD(`aev2${ts}`, "A-A1-00-202", "Elevations — E & W", "ELV"), mkD(`asc1${ts}`, "A-A1-AZ-SC-701", "Door & Window Schedule", "SCH")],
+  LS: ts => [mkD(`lgn1${ts}`, "L-A1-GN-001", "Cover Sheet", "GN"), mkD(`lgn2${ts}`, "L-A1-GN-002", "Drawing Index", "GN"), mkD(`lgn3${ts}`, "L-A1-GN-003", "General Notes", "GN"), mkD(`lgn4${ts}`, "L-A1-GN-004", "Legend & Abbreviations", "GN"), mkD(`lga1${ts}`, "L-A1-00-101", "Landscape Master Plan", "GA"), mkD(`lga2${ts}`, "L-A1-00-102", "Planting Plan", "GA"), mkD(`lga3${ts}`, "L-A1-00-103", "Hardscape Plan", "GA"), mkD(`lsc1${ts}`, "L-A1-AZ-SC-701", "Planting Schedule", "SCH")],
+  AL: ts => [mkD(`algn1${ts}`, "AL-A1-GN-001", "Cover Sheet", "GN"), mkD(`algn2${ts}`, "AL-A1-GN-002", "Drawing Index", "GN"), mkD(`algn3${ts}`, "AL-A1-GN-003", "General Notes", "GN"), mkD(`algn4${ts}`, "AL-A1-GN-004", "Legend & Abbreviations", "GN"), mkD(`alga1${ts}`, "AL-A1-00-101", "Lighting Layout", "GA"), mkD(`alsc1${ts}`, "AL-A1-AZ-SC-701", "Luminaire Schedule", "SCH")]
+};
+function mkDiscData(discs, populate = true) {
+  const ts = Date.now();
+  const r = {};
+  discs.forEach(k => {
+    r[k] = {
+      drawings: populate && TPL[k] ? TPL[k](ts) : [],
+      visuals: [],
+      specs: [],
+      boq: [],
+      schedules: []
+    };
+  });
+  return r;
+}
+const DEFAULT_SETTINGS = {
+  firmName: "Your Design Firm",
+  firmTagline: "Excellence in Every Detail",
+  firmLocation: "Doha, Qatar",
+  firmEmail: "",
+  firmPhone: "",
+  firmWebsite: "",
+  firmLogo: null,
+  ownerInitials: "XX",
+  copyright: `© ${new Date().getFullYear()} Your Design Firm. All rights reserved.`
+};
+function genCode(projects, initials) {
+  const yr = String(new Date().getFullYear()).slice(-2);
+  const codes = projects.map(p => p.code || '').filter(c => c.startsWith(yr));
+  let max = 0;
+  codes.forEach(c => {
+    const m = c.match(/^(\d{2})(\d{2})/);
+    if (m) max = Math.max(max, parseInt(m[2], 10));
+  });
+  return `${yr}${String(max + 1).padStart(2, '0')}-${(initials || 'XX').toUpperCase().slice(0, 4)}`;
+}
+function calcP(phases) {
+  const v = Object.values(phases);
+  return Math.round(v.reduce((a, b) => a + b, 0) / v.length);
+}
+function nRev(r) {
+  if (r === "-" || !r) return "A";
+  return String.fromCharCode(r.charCodeAt(0) + 1);
+}
+
+// ─── ICONS ────────────────────────────────────────────────────
+function Icon({
+  n,
+  sz = 14
+}) {
+  const I = {
+    dash: /*#__PURE__*/React.createElement("svg", {
+      width: sz,
+      height: sz,
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: "1.8",
+      viewBox: "0 0 24 24"
+    }, /*#__PURE__*/React.createElement("rect", {
+      x: "3",
+      y: "3",
+      width: "7",
+      height: "7",
+      rx: "1"
+    }), /*#__PURE__*/React.createElement("rect", {
+      x: "14",
+      y: "3",
+      width: "7",
+      height: "7",
+      rx: "1"
+    }), /*#__PURE__*/React.createElement("rect", {
+      x: "3",
+      y: "14",
+      width: "7",
+      height: "7",
+      rx: "1"
+    }), /*#__PURE__*/React.createElement("rect", {
+      x: "14",
+      y: "14",
+      width: "7",
+      height: "7",
+      rx: "1"
+    })),
+    proj: /*#__PURE__*/React.createElement("svg", {
+      width: sz,
+      height: sz,
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: "1.8",
+      viewBox: "0 0 24 24"
+    }, /*#__PURE__*/React.createElement("path", {
+      d: "M3 7h18M3 12h18M3 17h12"
+    })),
+    drw: /*#__PURE__*/React.createElement("svg", {
+      width: sz,
+      height: sz,
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: "1.8",
+      viewBox: "0 0 24 24"
+    }, /*#__PURE__*/React.createElement("path", {
+      d: "M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"
+    }), /*#__PURE__*/React.createElement("polyline", {
+      points: "14 2 14 8 20 8"
+    })),
+    snd: /*#__PURE__*/React.createElement("svg", {
+      width: sz,
+      height: sz,
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: "1.8",
+      viewBox: "0 0 24 24"
+    }, /*#__PURE__*/React.createElement("line", {
+      x1: "22",
+      y1: "2",
+      x2: "11",
+      y2: "13"
+    }), /*#__PURE__*/React.createElement("polygon", {
+      points: "22 2 15 22 11 13 2 9 22 2"
+    })),
+    plus: /*#__PURE__*/React.createElement("svg", {
+      width: sz,
+      height: sz,
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: "2.2",
+      viewBox: "0 0 24 24"
+    }, /*#__PURE__*/React.createElement("line", {
+      x1: "12",
+      y1: "5",
+      x2: "12",
+      y2: "19"
+    }), /*#__PURE__*/React.createElement("line", {
+      x1: "5",
+      y1: "12",
+      x2: "19",
+      y2: "12"
+    })),
+    back: /*#__PURE__*/React.createElement("svg", {
+      width: sz,
+      height: sz,
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: "2",
+      viewBox: "0 0 24 24"
+    }, /*#__PURE__*/React.createElement("polyline", {
+      points: "15 18 9 12 15 6"
+    })),
+    rev: /*#__PURE__*/React.createElement("svg", {
+      width: sz,
+      height: sz,
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: "1.8",
+      viewBox: "0 0 24 24"
+    }, /*#__PURE__*/React.createElement("polyline", {
+      points: "1 4 1 10 7 10"
+    }), /*#__PURE__*/React.createElement("path", {
+      d: "M3.51 15a9 9 0 102.13-9.36L1 10"
+    })),
+    set: /*#__PURE__*/React.createElement("svg", {
+      width: sz,
+      height: sz,
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: "1.8",
+      viewBox: "0 0 24 24"
+    }, /*#__PURE__*/React.createElement("circle", {
+      cx: "12",
+      cy: "12",
+      r: "3"
+    }), /*#__PURE__*/React.createElement("path", {
+      d: "M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"
+    })),
+    folder: /*#__PURE__*/React.createElement("svg", {
+      width: sz,
+      height: sz,
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: "1.8",
+      viewBox: "0 0 24 24"
+    }, /*#__PURE__*/React.createElement("path", {
+      d: "M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"
+    })),
+    up: /*#__PURE__*/React.createElement("svg", {
+      width: sz,
+      height: sz,
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: "1.8",
+      viewBox: "0 0 24 24"
+    }, /*#__PURE__*/React.createElement("polyline", {
+      points: "16 16 12 12 8 16"
+    }), /*#__PURE__*/React.createElement("line", {
+      x1: "12",
+      y1: "12",
+      x2: "12",
+      y2: "21"
+    }), /*#__PURE__*/React.createElement("path", {
+      d: "M20.39 18.39A5 5 0 0018 9h-1.26A8 8 0 103 16.3"
+    })),
+    trash: /*#__PURE__*/React.createElement("svg", {
+      width: sz,
+      height: sz,
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: "1.8",
+      viewBox: "0 0 24 24"
+    }, /*#__PURE__*/React.createElement("polyline", {
+      points: "3 6 5 6 21 6"
+    }), /*#__PURE__*/React.createElement("path", {
+      d: "M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"
+    })),
+    check: /*#__PURE__*/React.createElement("svg", {
+      width: sz,
+      height: sz,
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: "2.5",
+      viewBox: "0 0 24 24"
+    }, /*#__PURE__*/React.createElement("polyline", {
+      points: "20 6 9 17 4 12"
+    })),
+    cloud: /*#__PURE__*/React.createElement("svg", {
+      width: sz,
+      height: sz,
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: "1.8",
+      viewBox: "0 0 24 24"
+    }, /*#__PURE__*/React.createElement("path", {
+      d: "M18 10h-1.26A8 8 0 109 20h9a5 5 0 000-10z"
+    })),
+    arch: /*#__PURE__*/React.createElement("svg", {
+      width: sz,
+      height: sz,
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: "1.8",
+      viewBox: "0 0 24 24"
+    }, /*#__PURE__*/React.createElement("path", {
+      d: "M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 002 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"
+    }))
+  };
+  return I[n] || null;
+}
+function Badge({
+  s
+}) {
+  const m = SM[s] || SM["not-started"];
+  return /*#__PURE__*/React.createElement("span", {
+    className: `badge ${m.cls}`
+  }, m.label);
+}
+
+// ─── FOLDER BUTTON ────────────────────────────────────────────
+function FolderBtn({
+  project,
+  settings,
+  subPath
+}) {
+  const [loading, sLoading] = useState(false);
+  const open = async e => {
+    e.stopPropagation();
+    sLoading(true);
+    if (subPath) {
+      await openOneDriveFolder(project, settings, subPath);
+    } else {
+      await openOneDriveFolder(project, settings);
+    }
+    sLoading(false);
+  };
+  return /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-g btn-sm",
+    onClick: open,
+    title: "Open in OneDrive",
+    style: {
+      gap: 4
+    }
+  }, "\uD83D\uDCC1 ", loading ? 'Opening…' : 'OneDrive');
+}
+
+// ─── DISC SELECTOR ────────────────────────────────────────────
+function DiscSelector({
+  selected,
+  onChange,
+  label = "Disciplines in scope"
+}) {
+  const tog = d => onChange(selected.includes(d) ? selected.filter(x => x !== d) : [...selected, d]);
+  return /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, label), /*#__PURE__*/React.createElement("div", {
+    className: "disc-grid"
+  }, DISC_ALL.map(d => /*#__PURE__*/React.createElement("div", {
+    key: d,
+    className: `disc-opt${selected.includes(d) ? ' sel' : ''}`,
+    onClick: () => tog(d)
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "disc-opt-check"
+  }, selected.includes(d) && /*#__PURE__*/React.createElement("svg", {
+    width: "9",
+    height: "9",
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "white",
+    strokeWidth: "3.5"
+  }, /*#__PURE__*/React.createElement("polyline", {
+    points: "20 6 9 17 4 12"
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "disc-dot",
+    style: {
+      background: DC[d]
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "disc-opt-info"
+  }, /*#__PURE__*/React.createElement("h4", null, d), /*#__PURE__*/React.createElement("p", null, DN[d]))))));
+}
+
+// ─── MODALS ───────────────────────────────────────────────────
+function Modal({
+  title,
+  onClose,
+  children,
+  footer,
+  wide
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    className: "mo",
+    onClick: e => e.target === e.currentTarget && onClose()
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "modal",
+    style: wide ? {
+      maxWidth: 740
+    } : {}
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "modal-hd"
+  }, /*#__PURE__*/React.createElement("h2", null, title), /*#__PURE__*/React.createElement("button", {
+    className: "xbtn",
+    onClick: onClose
+  }, "\xD7")), /*#__PURE__*/React.createElement("div", {
+    className: "modal-bd"
+  }, children), footer && /*#__PURE__*/React.createElement("div", {
+    className: "modal-ft"
+  }, footer)));
+}
+function NewProjModal({
+  onClose,
+  onSave,
+  projects,
+  settings
+}) {
+  const autoCode = genCode(projects, settings.ownerInitials);
+  const yr = autoCode.slice(0, 2),
+    ser = autoCode.slice(2, 4);
+  const [f, sf] = useState({
+    codeYear: yr,
+    codeSerial: ser,
+    codeOwner: (settings.ownerInitials || 'XX').toUpperCase(),
+    name: '',
+    client: '',
+    location: '',
+    startDate: '',
+    targetDate: '',
+    pm: '',
+    contractValue: '',
+    disciplines: ['ID'],
+    populate: true
+  });
+  const u = (k, v) => sf(p => ({
+    ...p,
+    [k]: v
+  }));
+  const code = `${f.codeYear}${f.codeSerial}-${f.codeOwner}`;
+  const [step, sStep] = useState(1);
+  const [msg, sMsg] = useState(null);
+  const goNext = () => {
+    if (!f.name || !f.client || !f.disciplines.length) {
+      sMsg('Fill Project Name, Client and select disciplines.');
+      return;
+    }
+    sMsg(null);
+    sStep(2);
+  };
+  const save = () => {
+    const proj = {
+      id: 'p' + Date.now(),
+      code,
+      name: f.name,
+      client: f.client,
+      location: f.location,
+      startDate: f.startDate,
+      targetDate: f.targetDate,
+      pm: f.pm,
+      contractValue: f.contractValue,
+      status: 'active',
+      disciplines: f.disciplines,
+      lod: mkDiscData(f.disciplines, f.populate),
+      moms: [],
+      feedback: [],
+      transmittals: [],
+      phases: {
+        discovery: 0,
+        concept: 0,
+        schematic: 0,
+        development: 0,
+        documents: 0,
+        delivery: 0
+      },
+      linkedModules: {
+        specsFile: null,
+        feeFile: null
+      }
+    };
+    // Save project data and close modal immediately
+    onSave(proj);
+    onClose();
+    // Folders can be created via the "📁 Create Folders" button on the project page
+  };
+  return /*#__PURE__*/React.createElement(Modal, {
+    title: step === 1 ? "New Project — Details" : "New Project — Confirm",
+    onClose: onClose,
+    wide: true,
+    footer: step === 1 ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-g",
+      onClick: onClose
+    }, "Cancel"), /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-p",
+      onClick: goNext
+    }, "Next \u2192")) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-g",
+      onClick: () => sStep(1)
+    }, "\u2190 Back"), /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-ok",
+      onClick: save
+    }, "\u2713 Create Project"))
+  }, step === 1 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    className: "code-box"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      fontWeight: 600,
+      letterSpacing: 2,
+      color: 'rgba(255,255,255,.6)',
+      marginBottom: 6
+    }
+  }, "PROJECT CODE"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: 'var(--fh)',
+      fontSize: 26,
+      color: 'white',
+      letterSpacing: 3,
+      marginBottom: 10
+    }
+  }, code), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 12
+    }
+  }, [['Year (YY)', f.codeYear, 'codeYear'], ['Serial', f.codeSerial, 'codeSerial'], ['Initials', f.codeOwner, 'codeOwner']].map(([lbl, val, key]) => /*#__PURE__*/React.createElement("div", {
+    key: key,
+    style: {
+      flex: 1
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 8,
+      letterSpacing: 1,
+      color: 'rgba(255,255,255,.55)',
+      marginBottom: 3
+    }
+  }, lbl), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: val,
+    onChange: e => u(key, e.target.value.toUpperCase().slice(0, key === 'codeOwner' ? 4 : 2)),
+    style: {
+      background: 'rgba(255,255,255,.12)',
+      border: '1px solid rgba(255,255,255,.25)',
+      color: 'white',
+      fontWeight: 600
+    }
+  }))))), msg && /*#__PURE__*/React.createElement("div", {
+    className: "alert al-w"
+  }, msg), /*#__PURE__*/React.createElement("div", {
+    className: "fr"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Project Name *"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: f.name,
+    onChange: e => u('name', e.target.value)
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Client *"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: f.client,
+    onChange: e => u('client', e.target.value)
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "fr"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Location"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: f.location,
+    onChange: e => u('location', e.target.value)
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Project Manager"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: f.pm,
+    onChange: e => u('pm', e.target.value)
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "fr"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Start Date"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    type: "date",
+    value: f.startDate,
+    onChange: e => u('startDate', e.target.value)
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Target Date"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    type: "date",
+    value: f.targetDate,
+    onChange: e => u('targetDate', e.target.value)
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Contract Value"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    placeholder: "QAR 0",
+    value: f.contractValue,
+    onChange: e => u('contractValue', e.target.value)
+  })), /*#__PURE__*/React.createElement(DiscSelector, {
+    selected: f.disciplines,
+    onChange: v => u('disciplines', v)
+  })), step === 2 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 12,
+      alignItems: 'center',
+      padding: '12px 14px',
+      background: 'var(--wm)',
+      borderRadius: 'var(--rl)',
+      border: '1px solid var(--bd)',
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: 'var(--fh)',
+      fontSize: 20,
+      color: 'var(--bk)',
+      letterSpacing: 2
+    }
+  }, code), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      fontWeight: 600
+    }
+  }, f.name), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: 'var(--mi)'
+    }
+  }, f.client, " \xB7 ", f.location)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginLeft: 'auto',
+      display: 'flex',
+      gap: 4
+    }
+  }, f.disciplines.map(d => /*#__PURE__*/React.createElement("span", {
+    key: d,
+    className: `tag t-${d.toLowerCase()}`
+  }, d)))), /*#__PURE__*/React.createElement("div", {
+    className: "alert al-i"
+  }, /*#__PURE__*/React.createElement("strong", null, "OneDrive folders"), " will be created automatically in your ", /*#__PURE__*/React.createElement("code", null, "DPM App"), " folder on OneDrive when you confirm. You can open them from the project page."), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+      cursor: 'pointer',
+      fontSize: 12
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: f.populate,
+    onChange: e => u('populate', e.target.checked),
+    style: {
+      width: 13,
+      height: 13
+    }
+  }), /*#__PURE__*/React.createElement("span", null, "Pre-populate drawing register with standard drawings")))));
+}
+function AddDiscModal({
+  project,
+  onClose,
+  onSave
+}) {
+  const existing = project.disciplines || [];
+  const available = DISC_ALL.filter(d => !existing.includes(d));
+  const [sel, sSel] = useState([]);
+  if (!available.length) return /*#__PURE__*/React.createElement(Modal, {
+    title: "Add Discipline",
+    onClose: onClose
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "alert al-i"
+  }, "All disciplines are already active."));
+  const save = () => {
+    if (!sel.length) return;
+    const newLod = mkDiscData(sel, true);
+    onSave({
+      ...project,
+      disciplines: [...existing, ...sel],
+      lod: {
+        ...project.lod,
+        ...newLod
+      }
+    });
+    onClose();
+  };
+  return /*#__PURE__*/React.createElement(Modal, {
+    title: "Add Discipline",
+    onClose: onClose,
+    footer: /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-g",
+      onClick: onClose
+    }, "Cancel"), /*#__PURE__*/React.createElement("button", {
+      className: `btn ${sel.length ? 'btn-ok' : 'btn-g'}`,
+      onClick: save,
+      disabled: !sel.length
+    }, "Add Discipline"))
+  }, /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 12,
+      color: 'var(--mi)',
+      marginBottom: 12
+    }
+  }, "Select disciplines to add to ", /*#__PURE__*/React.createElement("strong", null, project.name), "."), /*#__PURE__*/React.createElement(DiscSelector, {
+    selected: sel,
+    onChange: sSel,
+    label: "Disciplines to add"
+  }));
+}
+function AddDrwModal({
+  disc,
+  onClose,
+  onSave
+}) {
+  const [f, sf] = useState({
+    title: '',
+    group: 'GA',
+    floor: '00',
+    paper: 'A1',
+    num: '',
+    assignee: ''
+  });
+  const u = (k, v) => sf(p => ({
+    ...p,
+    [k]: v
+  }));
+  const num = `${DP[disc] || disc}-${f.paper}-${f.floor}-${f.num.padStart(3, '0')}`;
+  const save = () => {
+    if (!f.title || !f.num) return;
+    onSave({
+      id: 'd' + Date.now(),
+      num,
+      title: f.title,
+      group: f.group,
+      rev: '-',
+      status: 'not-started',
+      assignee: f.assignee || '-',
+      issueDate: '-',
+      revisions: []
+    });
+    onClose();
+  };
+  return /*#__PURE__*/React.createElement(Modal, {
+    title: `Add Drawing — ${disc}`,
+    onClose: onClose,
+    footer: /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-g",
+      onClick: onClose
+    }, "Cancel"), /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-p",
+      onClick: save
+    }, "Add Drawing"))
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "alert al-i"
+  }, "Preview: ", /*#__PURE__*/React.createElement("strong", null, num)), /*#__PURE__*/React.createElement("div", {
+    className: "fr3"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Group"), /*#__PURE__*/React.createElement("select", {
+    className: "fs",
+    value: f.group,
+    onChange: e => u('group', e.target.value)
+  }, Object.entries(GRP).map(([k, v]) => /*#__PURE__*/React.createElement("option", {
+    key: k,
+    value: k
+  }, v)))), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Floor"), /*#__PURE__*/React.createElement("select", {
+    className: "fs",
+    value: f.floor,
+    onChange: e => u('floor', e.target.value)
+  }, FLOORS.map(v => /*#__PURE__*/React.createElement("option", {
+    key: v
+  }, v)))), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Paper"), /*#__PURE__*/React.createElement("select", {
+    className: "fs",
+    value: f.paper,
+    onChange: e => u('paper', e.target.value)
+  }, PAPERS.map(v => /*#__PURE__*/React.createElement("option", {
+    key: v
+  }, v))))), /*#__PURE__*/React.createElement("div", {
+    className: "fr"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Sheet No."), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    placeholder: "101",
+    value: f.num,
+    onChange: e => u('num', e.target.value)
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Title *"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: f.title,
+    onChange: e => u('title', e.target.value)
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Assignee"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: f.assignee,
+    onChange: e => u('assignee', e.target.value)
+  })));
+}
+function RevModal({
+  drawing,
+  onClose,
+  onSave
+}) {
+  const [f, sf] = useState({
+    rev: nRev(drawing.rev),
+    by: '',
+    date: new Date().toISOString().slice(0, 10),
+    comment: '',
+    status: 'under-review'
+  });
+  const u = (k, v) => sf(p => ({
+    ...p,
+    [k]: v
+  }));
+  const save = () => {
+    if (!f.by) return;
+    onSave(drawing.id, f);
+    onClose();
+  };
+  return /*#__PURE__*/React.createElement(Modal, {
+    title: "Issue New Revision",
+    onClose: onClose,
+    footer: /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-g",
+      onClick: onClose
+    }, "Cancel"), /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-a",
+      onClick: save
+    }, /*#__PURE__*/React.createElement(Icon, {
+      n: "rev",
+      sz: 11
+    }), " Issue Rev ", f.rev))
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "alert al-i"
+  }, /*#__PURE__*/React.createElement("strong", null, drawing.num), " \u2014 ", drawing.title), /*#__PURE__*/React.createElement("div", {
+    className: "fr"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Revision"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: f.rev,
+    onChange: e => u('rev', e.target.value)
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Date"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    type: "date",
+    value: f.date,
+    onChange: e => u('date', e.target.value)
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Issued By *"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: f.by,
+    onChange: e => u('by', e.target.value)
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Notes"), /*#__PURE__*/React.createElement("textarea", {
+    className: "ft",
+    value: f.comment,
+    onChange: e => u('comment', e.target.value)
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Update Status"), /*#__PURE__*/React.createElement("select", {
+    className: "fs",
+    value: f.status,
+    onChange: e => u('status', e.target.value)
+  }, SO.map(s => /*#__PURE__*/React.createElement("option", {
+    key: s,
+    value: s
+  }, SM[s].label)))));
+}
+function MOMModal({
+  onClose,
+  onSave
+}) {
+  const [f, sf] = useState({
+    date: new Date().toISOString().slice(0, 10),
+    title: '',
+    attendees: '',
+    notes: '',
+    actions: [{
+      num: 1,
+      text: '',
+      owner: '',
+      done: false
+    }]
+  });
+  const u = (k, v) => sf(p => ({
+    ...p,
+    [k]: v
+  }));
+  const save = () => {
+    if (!f.title) return;
+    onSave({
+      ...f,
+      id: 'm' + Date.now()
+    });
+    onClose();
+  };
+  return /*#__PURE__*/React.createElement(Modal, {
+    title: "New MOM",
+    onClose: onClose,
+    footer: /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-g",
+      onClick: onClose
+    }, "Cancel"), /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-p",
+      onClick: save
+    }, "Save MOM"))
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fr"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Date"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    type: "date",
+    value: f.date,
+    onChange: e => u('date', e.target.value)
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Title *"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: f.title,
+    onChange: e => u('title', e.target.value)
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Attendees"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: f.attendees,
+    onChange: e => u('attendees', e.target.value)
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Notes"), /*#__PURE__*/React.createElement("textarea", {
+    className: "ft",
+    value: f.notes,
+    onChange: e => u('notes', e.target.value)
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      justifyContent: 'space-between',
+      marginBottom: 6
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl",
+    style: {
+      margin: 0
+    }
+  }, "Action Items"), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-g btn-xs",
+    onClick: () => sf(p => ({
+      ...p,
+      actions: [...p.actions, {
+        num: p.actions.length + 1,
+        text: '',
+        owner: '',
+        done: false
+      }]
+    }))
+  }, "+ Add")), f.actions.map((a, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: 'grid',
+      gridTemplateColumns: '1fr 100px',
+      gap: 8,
+      marginBottom: 5
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    placeholder: `Action ${a.num}`,
+    value: a.text,
+    onChange: e => sf(p => ({
+      ...p,
+      actions: p.actions.map((x, j) => j === i ? {
+        ...x,
+        text: e.target.value
+      } : x)
+    }))
+  }), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    placeholder: "Owner",
+    value: a.owner,
+    onChange: e => sf(p => ({
+      ...p,
+      actions: p.actions.map((x, j) => j === i ? {
+        ...x,
+        owner: e.target.value
+      } : x)
+    }))
+  })))));
+}
+function TransModal({
+  project,
+  disc,
+  onClose,
+  onSave
+}) {
+  const drawings = (project.lod[disc]?.drawings || []).filter(d => d.status !== 'not-started');
+  const [sel, sSel] = useState([]);
+  const [f, sf] = useState({
+    ref: `TRM-${String((project.transmittals || []).length + 1).padStart(3, '0')}`,
+    date: new Date().toISOString().slice(0, 10),
+    to: project.client,
+    purpose: 'For Approval',
+    notes: ''
+  });
+  const tog = id => sSel(s => s.includes(id) ? s.filter(x => x !== id) : [...s, id]);
+  const save = () => {
+    if (!sel.length) return;
+    onSave({
+      ...f,
+      id: 't' + Date.now(),
+      drawings: sel
+    });
+    onClose();
+  };
+  return /*#__PURE__*/React.createElement(Modal, {
+    title: "Generate Transmittal",
+    onClose: onClose,
+    footer: /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-g",
+      onClick: onClose
+    }, "Cancel"), /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-a",
+      onClick: save
+    }, /*#__PURE__*/React.createElement(Icon, {
+      n: "snd",
+      sz: 11
+    }), " Generate"))
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fr3"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Ref."), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: f.ref,
+    onChange: e => sf(p => ({
+      ...p,
+      ref: e.target.value
+    }))
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Date"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    type: "date",
+    value: f.date,
+    onChange: e => sf(p => ({
+      ...p,
+      date: e.target.value
+    }))
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Purpose"), /*#__PURE__*/React.createElement("select", {
+    className: "fs",
+    value: f.purpose,
+    onChange: e => sf(p => ({
+      ...p,
+      purpose: e.target.value
+    }))
+  }, ["For Approval", "For Information", "For Construction", "For Comment", "As Built"].map(p => /*#__PURE__*/React.createElement("option", {
+    key: p
+  }, p))))), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "To"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: f.to,
+    onChange: e => sf(p => ({
+      ...p,
+      to: e.target.value
+    }))
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Select Drawings (", sel.length, " selected)"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      border: '1px solid var(--bd)',
+      borderRadius: 'var(--r)',
+      overflow: 'hidden',
+      maxHeight: 180,
+      overflowY: 'auto'
+    }
+  }, drawings.length === 0 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: 10,
+      color: 'var(--sl)',
+      fontSize: 12
+    }
+  }, "No issued drawings") : drawings.map(d => /*#__PURE__*/React.createElement("div", {
+    key: d.id,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+      padding: '6px 10px',
+      borderBottom: '1px solid var(--bg)',
+      background: sel.includes(d.id) ? 'var(--wm)' : 'var(--wh)',
+      cursor: 'pointer'
+    },
+    onClick: () => tog(d.id)
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 13,
+      height: 13,
+      border: `1.5px solid ${sel.includes(d.id) ? 'var(--ac)' : 'var(--lt)'}`,
+      borderRadius: 2,
+      background: sel.includes(d.id) ? 'var(--ac)' : 'transparent',
+      flexShrink: 0
+    }
+  }), /*#__PURE__*/React.createElement("span", {
+    className: "drn"
+  }, d.num), /*#__PURE__*/React.createElement("span", {
+    style: {
+      flex: 1,
+      fontSize: 11
+    }
+  }, d.title), /*#__PURE__*/React.createElement(Badge, {
+    s: d.status
+  }))))), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Notes"), /*#__PURE__*/React.createElement("textarea", {
+    className: "ft",
+    value: f.notes,
+    onChange: e => sf(p => ({
+      ...p,
+      notes: e.target.value
+    }))
+  })));
+}
+
+// ─── DRAWING DETAIL ───────────────────────────────────────────
+function DrawingDetail({
+  drawing,
+  project,
+  settings,
+  onBack,
+  onAddRev,
+  onChgStatus
+}) {
+  const [showRev, sRev] = useState(false);
+  const discKey = Object.entries(project.lod || {}).find(([, d]) => (d.drawings || []).some(x => x.id === drawing.id))?.[0];
+  return /*#__PURE__*/React.createElement("div", null, showRev && /*#__PURE__*/React.createElement(RevModal, {
+    drawing: drawing,
+    onClose: () => sRev(false),
+    onSave: onAddRev
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+      marginBottom: 14,
+      flexWrap: 'wrap'
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-g btn-sm",
+    onClick: onBack
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "back",
+    sz: 11
+  }), " Back"), /*#__PURE__*/React.createElement("h2", {
+    style: {
+      fontFamily: 'var(--fh)',
+      fontSize: 18,
+      fontWeight: 400
+    }
+  }, drawing.num), /*#__PURE__*/React.createElement(Badge, {
+    s: drawing.status
+  }), drawing.rev !== '-' && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: 'var(--sl)'
+    }
+  }, "Rev ", drawing.rev), discKey && GROUP_FOLDER[drawing.group] && /*#__PURE__*/React.createElement(FolderBtn, {
+    project: project,
+    settings: settings,
+    subPath: `${DISC_NAMES_FULL[discKey]}/${GROUP_FOLDER[drawing.group]}`
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "g2",
+    style: {
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card-hd"
+  }, /*#__PURE__*/React.createElement("h3", null, "Drawing Information")), /*#__PURE__*/React.createElement("div", {
+    className: "ig"
+  }, [['Number', drawing.num], ['Title', drawing.title], ['Revision', drawing.rev], ['Assignee', drawing.assignee], ['Issue Date', drawing.issueDate], ['Group', GRP[drawing.group] || drawing.group]].map(([k, v]) => /*#__PURE__*/React.createElement("div", {
+    key: k,
+    className: "iif"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "lbl"
+  }, k), /*#__PURE__*/React.createElement("div", {
+    className: "val"
+  }, v || '—'))))), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card-hd"
+  }, /*#__PURE__*/React.createElement("h3", null, "Status"), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-a btn-sm",
+    onClick: () => sRev(true)
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "rev",
+    sz: 10
+  }), " Issue Revision")), /*#__PURE__*/React.createElement("div", {
+    className: "card-bd"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Update Status"), /*#__PURE__*/React.createElement("select", {
+    className: "fs",
+    value: drawing.status,
+    onChange: e => onChgStatus(drawing.id, e.target.value)
+  }, SO.map(s => /*#__PURE__*/React.createElement("option", {
+    key: s,
+    value: s
+  }, SM[s].label)))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 5,
+      marginTop: 6
+    }
+  }, SO.map(s => /*#__PURE__*/React.createElement("div", {
+    key: s,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 7
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 7,
+      height: 7,
+      borderRadius: '50%',
+      background: drawing.status === s ? 'var(--ac)' : 'var(--bd)'
+    }
+  }), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: drawing.status === s ? 'var(--ch)' : 'var(--sl)',
+      fontWeight: drawing.status === s ? 600 : 400
+    }
+  }, SM[s].label), drawing.status === s && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 9,
+      color: 'var(--ac)',
+      fontWeight: 600
+    }
+  }, "\u2190 current"))))))), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card-hd"
+  }, /*#__PURE__*/React.createElement("h3", null, "Revision History")), /*#__PURE__*/React.createElement("div", {
+    className: "card-bd"
+  }, drawing.revisions.length === 0 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      padding: '24px 16px',
+      color: 'var(--sl)'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 28,
+      marginBottom: 6
+    }
+  }, "\uD83D\uDCCB"), /*#__PURE__*/React.createElement("div", null, "No revisions yet")) : /*#__PURE__*/React.createElement("div", null, [...drawing.revisions].reverse().map((r, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    className: "rev-it"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: `rev-dot${i === 0 ? ' cur' : ''}`
+  }, r.rev), /*#__PURE__*/React.createElement("div", {
+    className: "rev-cnt"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 7,
+      alignItems: 'center',
+      marginBottom: 2
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      fontWeight: 600,
+      color: 'var(--ch)'
+    }
+  }, r.by), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      color: 'var(--sl)'
+    }
+  }, r.date), i === 0 && /*#__PURE__*/React.createElement(Badge, {
+    s: drawing.status
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: 'var(--mi)'
+    }
+  }, r.comment || 'No notes'))))))));
+}
+
+// ─── DISCIPLINE VIEW ──────────────────────────────────────────
+function DiscView({
+  project,
+  disc,
+  onUpdate,
+  settings
+}) {
+  const [sub, sSub] = useState('lod');
+  const [showAdd, sAdd] = useState(false);
+  const [showTrans, sTrans] = useState(false);
+  const [selDrw, sSel] = useState(null);
+  const [filter, sFilter] = useState('all');
+  const dd = project.lod[disc] || {
+    drawings: [],
+    visuals: [],
+    specs: [],
+    boq: [],
+    schedules: []
+  };
+  const drws = dd.drawings || [];
+  const filtDrws = filter === 'all' ? drws : drws.filter(d => d.status === filter);
+  const updD = nd => onUpdate({
+    ...project,
+    lod: {
+      ...project.lod,
+      [disc]: {
+        ...dd,
+        ...nd
+      }
+    }
+  });
+  const addDrw = d => updD({
+    drawings: [...drws, d]
+  });
+  const addRev = (id, rv) => {
+    const nl = drws.map(d => d.id === id ? {
+      ...d,
+      rev: rv.rev,
+      status: rv.status,
+      issueDate: rv.date,
+      revisions: [...d.revisions, {
+        rev: rv.rev,
+        date: rv.date,
+        by: rv.by,
+        comment: rv.comment
+      }]
+    } : d);
+    updD({
+      drawings: nl
+    });
+    sSel(s => s ? {
+      ...s,
+      ...nl.find(d => d.id === s.id)
+    } : null);
+  };
+  const chgStat = (id, st) => {
+    const nl = drws.map(d => d.id === id ? {
+      ...d,
+      status: st
+    } : d);
+    updD({
+      drawings: nl
+    });
+    sSel(s => s ? {
+      ...s,
+      status: st
+    } : null);
+  };
+  const addTrans = t => onUpdate({
+    ...project,
+    transmittals: [...(project.transmittals || []), t]
+  });
+  const chgItem = (type, id, st) => updD({
+    [type]: (dd[type] || []).map(x => x.id === id ? {
+      ...x,
+      status: st
+    } : x)
+  });
+  const delItem = (type, id) => updD({
+    [type]: (dd[type] || []).filter(x => x.id !== id)
+  });
+  const approved = drws.filter(d => d.status === 'approved').length;
+  const pct = drws.length ? Math.round(approved / drws.length * 100) : 0;
+  const STABS = ['lod', 'visuals', 'specs', 'boq', 'schedules', 'transmittals'];
+  const SLBL = {
+    lod: 'LOD — Drawings',
+    visuals: '3D Visuals',
+    specs: 'Specifications',
+    boq: 'BOQ',
+    schedules: 'Schedules',
+    transmittals: 'Transmittals'
+  };
+  if (selDrw) return /*#__PURE__*/React.createElement(DrawingDetail, {
+    drawing: selDrw,
+    project: project,
+    settings: settings,
+    onBack: () => sSel(null),
+    onAddRev: addRev,
+    onChgStatus: chgStat
+  });
+  return /*#__PURE__*/React.createElement("div", null, showAdd && /*#__PURE__*/React.createElement(AddDrwModal, {
+    disc: disc,
+    onClose: () => sAdd(false),
+    onSave: addDrw
+  }), showTrans && /*#__PURE__*/React.createElement(TransModal, {
+    project: project,
+    disc: disc,
+    onClose: () => sTrans(false),
+    onSave: addTrans
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "dh",
+    style: {
+      background: DC[disc]
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "dh-code"
+  }, disc), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 500,
+      fontSize: 13
+    }
+  }, DN[disc]), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      opacity: .75,
+      marginTop: 1
+    }
+  }, drws.length, " drawings \xB7 ", approved, " approved \xB7 ", pct, "%")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginLeft: 'auto',
+      display: 'flex',
+      gap: 5,
+      flexWrap: 'wrap'
+    }
+  }, /*#__PURE__*/React.createElement(FolderBtn, {
+    project: project,
+    settings: settings
+  }), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-g btn-sm",
+    style: {
+      color: 'white',
+      borderColor: 'rgba(255,255,255,.3)'
+    },
+    onClick: () => sTrans(true)
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "snd",
+    sz: 10
+  }), " Transmittal"), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-g btn-sm",
+    style: {
+      color: 'white',
+      borderColor: 'rgba(255,255,255,.3)'
+    },
+    onClick: () => sAdd(true)
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "plus",
+    sz: 10
+  }), " Add Drawing"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: 'var(--wh)',
+      border: '1px solid var(--bd)',
+      borderTop: 'none',
+      borderRadius: '0 0 var(--rl) var(--rl)',
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "tabs",
+    style: {
+      padding: '0 12px',
+      marginBottom: 0,
+      borderBottom: '1px solid var(--bg)'
+    }
+  }, STABS.map(t => /*#__PURE__*/React.createElement("div", {
+    key: t,
+    className: `tab${sub === t ? ' on' : ''}`,
+    onClick: () => sSub(t)
+  }, SLBL[t]))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: 12
+    }
+  }, sub === 'lod' && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "fbar"
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 9,
+      color: 'var(--sl)',
+      fontWeight: 600,
+      letterSpacing: 1,
+      marginRight: 3
+    }
+  }, "FILTER:"), [{
+    k: 'all',
+    l: `All (${drws.length})`
+  }, ...SO.map(s => ({
+    k: s,
+    l: `${SM[s].label} (${drws.filter(d => d.status === s).length})`
+  }))].map(({
+    k,
+    l
+  }) => /*#__PURE__*/React.createElement("span", {
+    key: k,
+    className: `fchip${filter === k ? ' on' : ''}`,
+    onClick: () => sFilter(k)
+  }, l))), filtDrws.length === 0 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      padding: 24,
+      color: 'var(--sl)'
+    }
+  }, "No drawings match filter") : (() => {
+    const fg = {};
+    filtDrws.forEach(d => {
+      if (!fg[d.group]) fg[d.group] = [];
+      fg[d.group].push(d);
+    });
+    return Object.entries(fg).map(([grp, ds]) => /*#__PURE__*/React.createElement("div", {
+      key: grp,
+      className: "lg"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "lgh"
+    }, /*#__PURE__*/React.createElement("h4", null, GRP[grp] || grp), /*#__PURE__*/React.createElement("div", {
+      className: "lgh-r"
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 9
+      }
+    }, ds.filter(d => d.status === 'approved').length, "/", ds.length), /*#__PURE__*/React.createElement("button", {
+      style: {
+        background: 'rgba(255,255,255,.15)',
+        border: '1px solid rgba(255,255,255,.25)',
+        color: 'white',
+        padding: '2px 7px',
+        borderRadius: 3,
+        fontSize: 9.5,
+        cursor: 'pointer'
+      },
+      onClick: e => {
+        e.stopPropagation();
+        openOneDriveFolder(project, settings, DISC_NAMES_FULL[disc] + '/' + (GROUP_FOLDER[grp] || ''));
+      },
+      title: "Open folder"
+    }, "\uD83D\uDCC1"))), /*#__PURE__*/React.createElement("table", {
+      className: "tbl tbl-cl"
+    }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null, "Drawing No."), /*#__PURE__*/React.createElement("th", null, "Title"), /*#__PURE__*/React.createElement("th", null, "Rev"), /*#__PURE__*/React.createElement("th", null, "Status"), /*#__PURE__*/React.createElement("th", null, "Issued"))), /*#__PURE__*/React.createElement("tbody", null, ds.map(d => /*#__PURE__*/React.createElement("tr", {
+      key: d.id,
+      onClick: () => sSel(d)
+    }, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+      className: "drn"
+    }, d.num)), /*#__PURE__*/React.createElement("td", {
+      style: {
+        maxWidth: 200,
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap'
+      }
+    }, d.title), /*#__PURE__*/React.createElement("td", {
+      style: {
+        fontWeight: 600
+      }
+    }, d.rev), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(Badge, {
+      s: d.status
+    })), /*#__PURE__*/React.createElement("td", {
+      style: {
+        fontSize: 10,
+        color: 'var(--sl)'
+      }
+    }, d.issueDate)))))));
+  })()), ['visuals', 'specs', 'boq', 'schedules'].includes(sub) && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      justifyContent: 'flex-end',
+      marginBottom: 8
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-p btn-sm",
+    onClick: () => {
+      const t = prompt('Item title:');
+      if (t) updD({
+        [sub]: [...(dd[sub] || []), {
+          id: 'i' + Date.now(),
+          title: t,
+          status: 'not-started',
+          rev: '-',
+          date: '-',
+          assignee: '-',
+          notes: ''
+        }]
+      });
+    }
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "plus",
+    sz: 10
+  }), " Add")), (dd[sub] || []).length === 0 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      padding: '20px',
+      color: 'var(--sl)',
+      fontSize: 12
+    }
+  }, "No items yet") : /*#__PURE__*/React.createElement("table", {
+    className: "tbl"
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null, "Title"), /*#__PURE__*/React.createElement("th", null, "Status"), /*#__PURE__*/React.createElement("th", null))), /*#__PURE__*/React.createElement("tbody", null, (dd[sub] || []).map(it => /*#__PURE__*/React.createElement("tr", {
+    key: it.id
+  }, /*#__PURE__*/React.createElement("td", {
+    style: {
+      fontWeight: 500
+    }
+  }, it.title), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("select", {
+    style: {
+      border: 'none',
+      background: 'transparent',
+      fontFamily: 'var(--fb)',
+      fontSize: 11,
+      cursor: 'pointer'
+    },
+    value: it.status,
+    onChange: e => chgItem(sub, it.id, e.target.value)
+  }, SO.map(s => /*#__PURE__*/React.createElement("option", {
+    key: s,
+    value: s
+  }, SM[s].label)))), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-g btn-xs",
+    onClick: () => delItem(sub, it.id)
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "trash",
+    sz: 11
+  })))))))), sub === 'transmittals' && /*#__PURE__*/React.createElement("div", null, (project.transmittals || []).length === 0 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      padding: 24,
+      color: 'var(--sl)'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 28,
+      marginBottom: 6
+    }
+  }, "\uD83D\uDCE8"), "No transmittals yet", /*#__PURE__*/React.createElement("br", null), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-p btn-sm",
+    style: {
+      marginTop: 10
+    },
+    onClick: () => sTrans(true)
+  }, "Generate Transmittal")) : (project.transmittals || []).map(t => {
+    const twgs = Object.values(project.lod).flatMap(d => d.drawings || []).filter(d => t.drawings.includes(d.id));
+    return /*#__PURE__*/React.createElement("div", {
+      key: t.id,
+      className: "card",
+      style: {
+        marginBottom: 10
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "trm"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "trm-hd"
+    }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+      className: "trm-title"
+    }, "Drawing Transmittal"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 9,
+        color: 'var(--mi)',
+        marginTop: 2
+      }
+    }, t.ref, " \xB7 ", t.date)), /*#__PURE__*/React.createElement("div", {
+      style: {
+        textAlign: 'right'
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "lbl"
+    }, "To"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontWeight: 600
+      }
+    }, t.to), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: 'var(--mi)'
+      }
+    }, t.purpose))), /*#__PURE__*/React.createElement("table", {
+      className: "tbl"
+    }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null, "#"), /*#__PURE__*/React.createElement("th", null, "Drawing No."), /*#__PURE__*/React.createElement("th", null, "Title"), /*#__PURE__*/React.createElement("th", null, "Rev"), /*#__PURE__*/React.createElement("th", null, "Status"))), /*#__PURE__*/React.createElement("tbody", null, twgs.map((d, i) => /*#__PURE__*/React.createElement("tr", {
+      key: d.id
+    }, /*#__PURE__*/React.createElement("td", {
+      style: {
+        color: 'var(--sl)'
+      }
+    }, i + 1), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+      className: "drn"
+    }, d.num)), /*#__PURE__*/React.createElement("td", null, d.title), /*#__PURE__*/React.createElement("td", {
+      style: {
+        fontWeight: 600
+      }
+    }, d.rev), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(Badge, {
+      s: d.status
+    })))))), t.notes && /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: 'var(--mi)',
+        fontStyle: 'italic',
+        paddingTop: 7,
+        borderTop: '1px solid var(--bg)',
+        marginTop: 6
+      }
+    }, t.notes)));
+  })))));
+}
+
+// ─── PROJECT DETAIL ───────────────────────────────────────────
+function ProjDetail({
+  project,
+  onBack,
+  onUpdate,
+  settings
+}) {
+  const [tab, sTab] = useState('overview');
+  const [showMOM, sMOM] = useState(false);
+  const [showFB, sFB] = useState(false);
+  const [showAddDisc, sAddDisc] = useState(false);
+  const [showArchiveConfirm, sArchConf] = useState(false);
+  const [fbForm, sFBF] = useState({
+    from: '',
+    subject: '',
+    text: ''
+  });
+  const isArchived = project.status === 'archived';
+  const pct = calcP(project.phases);
+  const addMOM = m => onUpdate({
+    ...project,
+    moms: [m, ...(project.moms || [])]
+  });
+  const addFB = () => {
+    if (!fbForm.text) return;
+    onUpdate({
+      ...project,
+      feedback: [{
+        id: 'f' + Date.now(),
+        date: new Date().toISOString().slice(0, 10),
+        resolved: false,
+        ...fbForm
+      }, ...(project.feedback || [])]
+    });
+    sFBF({
+      from: '',
+      subject: '',
+      text: ''
+    });
+    sFB(false);
+  };
+  const togFB = id => onUpdate({
+    ...project,
+    feedback: (project.feedback || []).map(f => f.id === id ? {
+      ...f,
+      resolved: !f.resolved
+    } : f)
+  });
+  const updPh = (ph, v) => onUpdate({
+    ...project,
+    phases: {
+      ...project.phases,
+      [ph]: Number(v)
+    }
+  });
+  const tabs = ['overview', ...(project.disciplines || []), 'moms', 'feedback'];
+  const tl = {
+    overview: 'Overview',
+    moms: 'MOM',
+    feedback: 'Client Feedback'
+  };
+  return /*#__PURE__*/React.createElement("div", null, showMOM && /*#__PURE__*/React.createElement(MOMModal, {
+    onClose: () => sMOM(false),
+    onSave: addMOM
+  }), showAddDisc && /*#__PURE__*/React.createElement(AddDiscModal, {
+    project: project,
+    onClose: () => sAddDisc(false),
+    onSave: u => {
+      onUpdate(u);
+      sAddDisc(false);
+    }
+  }), showArchiveConfirm && /*#__PURE__*/React.createElement("div", {
+    className: "mo",
+    onClick: e => e.target === e.currentTarget && sArchConf(false)
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "modal",
+    style: {
+      maxWidth: 440
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "modal-hd"
+  }, /*#__PURE__*/React.createElement("h2", null, "Archive Project"), /*#__PURE__*/React.createElement("button", {
+    className: "xbtn",
+    onClick: () => sArchConf(false)
+  }, "\xD7")), /*#__PURE__*/React.createElement("div", {
+    className: "modal-bd"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "arch-banner"
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 26
+    }
+  }, "\uD83D\uDCE6"), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("p", null, /*#__PURE__*/React.createElement("strong", null, "Archive \"", project.name, "\"?")), /*#__PURE__*/React.createElement("p", {
+    style: {
+      marginTop: 4
+    }
+  }, "Hidden from dashboard. All data preserved. Restore any time.")))), /*#__PURE__*/React.createElement("div", {
+    className: "modal-ft"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-g",
+    onClick: () => sArchConf(false)
+  }, "Cancel"), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-danger",
+    onClick: () => {
+      onUpdate({
+        ...project,
+        status: 'archived',
+        archivedAt: new Date().toISOString()
+      });
+      onBack();
+    }
+  }, "\uD83D\uDCE6 Archive")))), /*#__PURE__*/React.createElement("div", {
+    className: "bc-nav"
+  }, /*#__PURE__*/React.createElement("span", {
+    onClick: onBack
+  }, "Dashboard"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: 'var(--bd)'
+    }
+  }, "\u203A"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: 'var(--ch)'
+    }
+  }, project.code)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'flex-start',
+      justifyContent: 'space-between',
+      marginBottom: 12,
+      flexWrap: 'wrap',
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+      flexWrap: 'wrap'
+    }
+  }, /*#__PURE__*/React.createElement("h2", {
+    style: {
+      fontFamily: 'var(--fh)',
+      fontSize: 22,
+      fontWeight: 400
+    }
+  }, project.name), (project.disciplines || []).map(d => /*#__PURE__*/React.createElement("span", {
+    key: d,
+    className: `tag t-${d.toLowerCase()}`
+  }, d))), /*#__PURE__*/React.createElement("p", {
+    style: {
+      color: 'var(--mi)',
+      fontSize: 11,
+      marginTop: 2
+    }
+  }, project.code, " \xB7 ", project.client, " \xB7 ", project.location)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 5,
+      flexWrap: 'wrap'
+    }
+  }, /*#__PURE__*/React.createElement(FolderBtn, {
+    project: project,
+    settings: settings
+  }), /*#__PURE__*/React.createElement(CreateFoldersBtn, {
+    project: project
+  }), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-g btn-sm",
+    onClick: () => sAddDisc(true)
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "plus",
+    sz: 10
+  }), " Add Discipline"), isArchived ? /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-ok btn-sm",
+    onClick: () => onUpdate({
+      ...project,
+      status: 'active',
+      archivedAt: null
+    })
+  }, "\u21A9 Restore") : /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-g btn-sm",
+    style: {
+      color: '#c0392b',
+      borderColor: '#f5c6c6'
+    },
+    onClick: () => sArchConf(true)
+  }, "\uD83D\uDCE6 Archive"), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-g btn-sm",
+    onClick: onBack
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "back",
+    sz: 11
+  }), " Back"))), isArchived && /*#__PURE__*/React.createElement("div", {
+    className: "arch-banner"
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 20
+    }
+  }, "\uD83D\uDCE6"), /*#__PURE__*/React.createElement("p", null, /*#__PURE__*/React.createElement("strong", null, "Archived."), " Hidden from dashboard. Data preserved."), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-ok btn-sm",
+    onClick: () => onUpdate({
+      ...project,
+      status: 'active',
+      archivedAt: null
+    })
+  }, "\u21A9 Restore")), /*#__PURE__*/React.createElement("div", {
+    className: "tabs"
+  }, tabs.map(t => /*#__PURE__*/React.createElement("div", {
+    key: t,
+    className: `tab${tab === t ? ' on' : ''}`,
+    onClick: () => sTab(t)
+  }, tl[t] || t))), tab === 'overview' && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "g2",
+    style: {
+      marginBottom: 12
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card-hd"
+  }, /*#__PURE__*/React.createElement("h3", null, "Project Information"), /*#__PURE__*/React.createElement(FolderBtn, {
+    project: project,
+    settings: settings
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "ig"
+  }, [['Code', project.code], ['Client', project.client], ['Location', project.location], ['PM', project.pm], ['Start', project.startDate], ['Target', project.targetDate], ['Contract', project.contractValue]].map(([k, v]) => /*#__PURE__*/React.createElement("div", {
+    key: k,
+    className: "iif"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "lbl"
+  }, k), /*#__PURE__*/React.createElement("div", {
+    className: "val"
+  }, v || '—'))))), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card-hd"
+  }, /*#__PURE__*/React.createElement("h3", null, "Phase Progress"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      color: 'var(--sl)'
+    }
+  }, pct, "%")), /*#__PURE__*/React.createElement("div", {
+    className: "card-bd"
+  }, PHS.map(ph => /*#__PURE__*/React.createElement("div", {
+    key: ph,
+    style: {
+      marginBottom: 9
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      justifyContent: 'space-between',
+      marginBottom: 2
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11.5,
+      color: 'var(--ch)'
+    }
+  }, PHL[ph]), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      fontWeight: 600,
+      color: 'var(--mi)'
+    }
+  }, project.phases[ph], "%")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 7,
+      alignItems: 'center'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "pb-w",
+    style: {
+      flex: 1,
+      height: 4
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "pb",
+    style: {
+      width: project.phases[ph] + '%'
+    }
+  })), /*#__PURE__*/React.createElement("input", {
+    type: "range",
+    min: "0",
+    max: "100",
+    value: project.phases[ph],
+    onChange: e => updPh(ph, e.target.value),
+    style: {
+      width: 60,
+      accentColor: 'var(--ch)',
+      cursor: 'pointer'
+    }
+  }))))))), /*#__PURE__*/React.createElement("div", {
+    className: "g3"
+  }, (project.disciplines || []).map(disc => {
+    const lod = project.lod[disc] || {};
+    const drws = lod.drawings || [];
+    const done = drws.filter(d => d.status === 'approved').length;
+    return /*#__PURE__*/React.createElement("div", {
+      key: disc,
+      className: "card",
+      style: {
+        cursor: 'pointer'
+      },
+      onClick: () => sTab(disc)
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        height: 3,
+        background: DC[disc],
+        borderRadius: 'var(--rl) var(--rl) 0 0'
+      }
+    }), /*#__PURE__*/React.createElement("div", {
+      className: "card-bd"
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'flex-start'
+      }
+    }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+      className: "lbl"
+    }, disc), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontFamily: 'var(--fh)',
+        fontSize: 13,
+        marginTop: 1
+      }
+    }, DN[disc])), /*#__PURE__*/React.createElement("span", {
+      className: `tag t-${disc.toLowerCase()}`
+    }, drws.length)), /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginTop: 6,
+        fontSize: 10,
+        display: 'flex',
+        gap: 8
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: '#3D3B3B',
+        fontWeight: 600
+      }
+    }, done, " approved")), /*#__PURE__*/React.createElement("div", {
+      className: "pb-w",
+      style: {
+        marginTop: 6,
+        height: 3
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "pb",
+      style: {
+        width: (drws.length ? Math.round(done / drws.length * 100) : 0) + '%',
+        background: DC[disc]
+      }
+    })), /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginTop: 8
+      },
+      onClick: e => e.stopPropagation()
+    }, /*#__PURE__*/React.createElement(FolderBtn, {
+      project: project,
+      settings: settings
+    }))));
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      border: '2px dashed var(--bd)',
+      boxShadow: 'none',
+      cursor: 'pointer',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      flexDirection: 'column',
+      gap: 5,
+      padding: 20,
+      minHeight: 90
+    },
+    onClick: () => sAddDisc(true)
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "plus",
+    sz: 18
+  }), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: 'var(--mi)'
+    }
+  }, "Add Discipline")))), (project.disciplines || []).includes(tab) && /*#__PURE__*/React.createElement(DiscView, {
+    project: project,
+    disc: tab,
+    onUpdate: onUpdate,
+    settings: settings
+  }), tab === 'moms' && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      justifyContent: 'flex-end',
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-p btn-sm",
+    onClick: () => sMOM(true)
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "plus",
+    sz: 10
+  }), " New MOM")), (project.moms || []).length === 0 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      padding: 32,
+      color: 'var(--sl)'
+    }
+  }, "No meetings recorded") : (project.moms || []).map(m => /*#__PURE__*/React.createElement("div", {
+    key: m.id,
+    style: {
+      border: '1px solid var(--bd)',
+      borderRadius: 'var(--rl)',
+      overflow: 'hidden',
+      marginBottom: 9
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: 'var(--wm)',
+      padding: '8px 12px',
+      display: 'flex',
+      gap: 10,
+      alignItems: 'center',
+      borderBottom: '1px solid var(--bg)'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 9.5,
+      fontWeight: 600,
+      color: 'var(--sl)'
+    }
+  }, m.date), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      fontWeight: 500,
+      flex: 1
+    }
+  }, m.title), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      color: 'var(--sl)'
+    }
+  }, m.attendees)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '9px 12px'
+    }
+  }, m.notes && /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 11.5,
+      color: 'var(--mi)',
+      marginBottom: 6
+    }
+  }, m.notes), m.actions.filter(a => a.text).map(a => /*#__PURE__*/React.createElement("div", {
+    key: a.num,
+    style: {
+      display: 'flex',
+      gap: 8,
+      padding: '4px 0',
+      borderBottom: '1px solid var(--bg)'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 9,
+      fontWeight: 700,
+      color: 'var(--ac)',
+      minWidth: 16
+    }
+  }, a.num), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: 'var(--ch)',
+      flex: 1
+    }
+  }, a.text), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      color: 'var(--mi)'
+    }
+  }, a.owner), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      color: a.done ? '#3D3B3B' : '#A89B93',
+      fontWeight: 600
+    }
+  }, a.done ? 'Done' : 'Pending'))))))), tab === 'feedback' && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      justifyContent: 'flex-end',
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-p btn-sm",
+    onClick: () => sFB(true)
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "plus",
+    sz: 10
+  }), " Log Feedback")), showFB && /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card-hd"
+  }, /*#__PURE__*/React.createElement("h3", null, "Log Feedback")), /*#__PURE__*/React.createElement("div", {
+    className: "card-bd"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fr"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "From"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: fbForm.from,
+    onChange: e => sFBF(f => ({
+      ...f,
+      from: e.target.value
+    })),
+    placeholder: project.client
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Subject"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: fbForm.subject,
+    onChange: e => sFBF(f => ({
+      ...f,
+      subject: e.target.value
+    }))
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Feedback *"), /*#__PURE__*/React.createElement("textarea", {
+    className: "ft",
+    value: fbForm.text,
+    onChange: e => sFBF(f => ({
+      ...f,
+      text: e.target.value
+    }))
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 7
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-p btn-sm",
+    onClick: addFB
+  }, "Save"), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-g btn-sm",
+    onClick: () => sFB(false)
+  }, "Cancel")))), (project.feedback || []).length === 0 && !showFB ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      padding: 32,
+      color: 'var(--sl)'
+    }
+  }, "No feedback recorded") : (project.feedback || []).map(f => /*#__PURE__*/React.createElement("div", {
+    key: f.id,
+    style: {
+      background: 'var(--wm)',
+      border: '1px solid var(--bd)',
+      borderRadius: 'var(--rl)',
+      padding: '10px 12px',
+      marginBottom: 8,
+      opacity: f.resolved ? .6 : 1
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      marginBottom: 4
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 6,
+      alignItems: 'center'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      fontWeight: 600,
+      color: 'var(--ch)'
+    }
+  }, f.from || project.client), f.subject && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      color: 'var(--sl)'
+    }
+  }, "re: ", f.subject), f.resolved && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 8,
+      fontWeight: 700,
+      color: '#3D3B3B',
+      background: 'rgba(61,59,59,.1)',
+      padding: '2px 5px',
+      borderRadius: 2
+    }
+  }, "RESOLVED")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 6
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      color: 'var(--sl)'
+    }
+  }, f.date), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-g btn-xs",
+    onClick: () => togFB(f.id)
+  }, f.resolved ? 'Reopen' : 'Resolve'))), /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 11.5,
+      color: 'var(--mi)',
+      lineHeight: 1.55
+    }
+  }, f.text)))));
+}
+
+// ─── DASHBOARD ────────────────────────────────────────────────
+function Dashboard({
+  projects,
+  onOpen
+}) {
+  const all = projects.flatMap(p => Object.values(p.lod || {}).flatMap(d => d.drawings || []));
+  const appr = all.filter(d => d.status === 'approved').length;
+  const pend = all.filter(d => d.status === 'client-review').length;
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "g4",
+    style: {
+      marginBottom: 16
+    }
+  }, [{
+    v: projects.length,
+    l: "Total Projects",
+    s: projects.filter(p => p.status === 'active').length + " active"
+  }, {
+    v: all.length,
+    l: "Total Drawings",
+    s: "across all projects"
+  }, {
+    v: appr,
+    l: "Approved",
+    s: (all.length ? Math.round(appr / all.length * 100) : 0) + "% complete"
+  }, {
+    v: pend,
+    l: "Awaiting Client",
+    s: "pending approval"
+  }].map((s, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    className: "stat"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stat-v"
+  }, s.v), /*#__PURE__*/React.createElement("div", {
+    className: "stat-l"
+  }, s.l), /*#__PURE__*/React.createElement("div", {
+    className: "stat-s"
+  }, s.s)))), /*#__PURE__*/React.createElement("div", {
+    className: "g3",
+    style: {
+      marginBottom: 16
+    }
+  }, projects.map(p => {
+    const pct = calcP(p.phases);
+    const drw = Object.values(p.lod || {}).flatMap(d => d.drawings || []);
+    const done = drw.filter(d => d.status === 'approved').length;
+    const pr = drw.filter(d => d.status === 'client-review').length;
+    return /*#__PURE__*/React.createElement("div", {
+      key: p.id,
+      className: "pc",
+      onClick: () => onOpen(p.id)
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "pc-top",
+      style: {
+        background: pct === 100 ? '#3D3B3B' : pct > 60 ? '#9E9690' : '#D4CFC9'
+      }
+    }), /*#__PURE__*/React.createElement("div", {
+      className: "pc-bd"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "pc-code"
+    }, p.code), /*#__PURE__*/React.createElement("div", {
+      className: "pc-name"
+    }, p.name), /*#__PURE__*/React.createElement("div", {
+      className: "pc-cl"
+    }, p.client, " \xB7 ", p.location), /*#__PURE__*/React.createElement("div", {
+      className: "pb-w"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "pb",
+      style: {
+        width: pct + '%'
+      }
+    })), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between'
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: 'flex',
+        gap: 3
+      }
+    }, (p.disciplines || []).map(d => /*#__PURE__*/React.createElement("span", {
+      key: d,
+      className: `tag t-${d.toLowerCase()}`
+    }, d))), /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 10,
+        fontWeight: 600,
+        color: 'var(--mi)'
+      }
+    }, pct, "%")), /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginTop: 7,
+        display: 'flex',
+        gap: 10,
+        fontSize: 10,
+        color: 'var(--sl)'
+      }
+    }, /*#__PURE__*/React.createElement("span", null, drw.length, " drawings"), /*#__PURE__*/React.createElement("span", null, done, " approved"), pr > 0 && /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: '#8C7B6E',
+        fontWeight: 600
+      }
+    }, pr, " for review"))));
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card-hd"
+  }, /*#__PURE__*/React.createElement("h3", null, "Recent Drawing Activity")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      overflowX: 'auto'
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    className: "tbl"
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null, "Drawing No."), /*#__PURE__*/React.createElement("th", null, "Title"), /*#__PURE__*/React.createElement("th", null, "Project"), /*#__PURE__*/React.createElement("th", null, "Rev"), /*#__PURE__*/React.createElement("th", null, "Status"), /*#__PURE__*/React.createElement("th", null, "Date"))), /*#__PURE__*/React.createElement("tbody", null, projects.flatMap(p => Object.values(p.lod || {}).flatMap(d => d.drawings || []).filter(d => d.issueDate && d.issueDate !== '-').map(d => ({
+    ...d,
+    pc: p.code
+  }))).sort((a, b) => b.issueDate.localeCompare(a.issueDate)).slice(0, 10).map(d => /*#__PURE__*/React.createElement("tr", {
+    key: d.id + d.pc
+  }, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+    className: "drn"
+  }, d.num)), /*#__PURE__*/React.createElement("td", {
+    style: {
+      maxWidth: 160,
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap'
+    }
+  }, d.title), /*#__PURE__*/React.createElement("td", {
+    style: {
+      fontSize: 10,
+      color: 'var(--mi)'
+    }
+  }, d.pc), /*#__PURE__*/React.createElement("td", {
+    style: {
+      fontWeight: 600
+    }
+  }, d.rev), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(Badge, {
+    s: d.status
+  })), /*#__PURE__*/React.createElement("td", {
+    style: {
+      color: 'var(--sl)',
+      fontSize: 10
+    }
+  }, d.issueDate))))))));
+}
+function GlobalDrawings({
+  projects
+}) {
+  const [filter, sFilter] = useState('all');
+  const all = projects.flatMap(p => Object.entries(p.lod || {}).flatMap(([disc, d]) => (d.drawings || []).map(w => ({
+    ...w,
+    disc,
+    pc: p.code
+  }))));
+  const shown = filter === 'all' ? all : all.filter(d => d.status === filter);
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "g4",
+    style: {
+      marginBottom: 14
+    }
+  }, SO.map(s => {
+    const c = all.filter(d => d.status === s).length;
+    return /*#__PURE__*/React.createElement("div", {
+      key: s,
+      className: "stat",
+      style: {
+        padding: '10px 12px'
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "stat-v",
+      style: {
+        fontSize: 20
+      }
+    }, c), /*#__PURE__*/React.createElement("div", {
+      className: "stat-l",
+      style: {
+        fontSize: 8
+      }
+    }, SM[s].label));
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "card-hd"
+  }, /*#__PURE__*/React.createElement("h3", null, "All Drawings"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      color: 'var(--sl)'
+    }
+  }, shown.length, " / ", all.length)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: '8px 12px 0'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fbar"
+  }, [{
+    k: 'all',
+    l: 'All'
+  }, ...SO.map(s => ({
+    k: s,
+    l: SM[s].label
+  }))].map(({
+    k,
+    l
+  }) => /*#__PURE__*/React.createElement("span", {
+    key: k,
+    className: `fchip${filter === k ? ' on' : ''}`,
+    onClick: () => sFilter(k)
+  }, l)))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      overflowX: 'auto'
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    className: "tbl"
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null, "Drawing No."), /*#__PURE__*/React.createElement("th", null, "Title"), /*#__PURE__*/React.createElement("th", null, "Disc."), /*#__PURE__*/React.createElement("th", null, "Project"), /*#__PURE__*/React.createElement("th", null, "Rev"), /*#__PURE__*/React.createElement("th", null, "Status"), /*#__PURE__*/React.createElement("th", null, "Issued"))), /*#__PURE__*/React.createElement("tbody", null, shown.map(d => /*#__PURE__*/React.createElement("tr", {
+    key: d.id + d.pc
+  }, /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+    className: "drn"
+  }, d.num)), /*#__PURE__*/React.createElement("td", {
+    style: {
+      maxWidth: 180,
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap'
+    }
+  }, d.title), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+    className: `tag t-${d.disc.toLowerCase()}`
+  }, d.disc)), /*#__PURE__*/React.createElement("td", {
+    style: {
+      fontSize: 10,
+      color: 'var(--mi)'
+    }
+  }, d.pc), /*#__PURE__*/React.createElement("td", {
+    style: {
+      fontWeight: 600
+    }
+  }, d.rev), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(Badge, {
+    s: d.status
+  })), /*#__PURE__*/React.createElement("td", {
+    style: {
+      fontSize: 10,
+      color: 'var(--sl)'
+    }
+  }, d.issueDate))))))));
+}
+function GlobalTrans({
+  projects
+}) {
+  const all = projects.flatMap(p => (p.transmittals || []).map(t => ({
+    ...t,
+    proj: p
+  })));
+  if (!all.length) return /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      padding: 40,
+      color: 'var(--sl)'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 32,
+      marginBottom: 8
+    }
+  }, "\uD83D\uDCE8"), /*#__PURE__*/React.createElement("div", null, "No transmittals yet"));
+  return /*#__PURE__*/React.createElement("div", null, all.map(t => {
+    const twgs = Object.values(t.proj.lod || {}).flatMap(d => d.drawings || []).filter(d => t.drawings.includes(d.id));
+    return /*#__PURE__*/React.createElement("div", {
+      key: t.id,
+      className: "card",
+      style: {
+        marginBottom: 12
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "trm"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "trm-hd"
+    }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+      className: "trm-title"
+    }, "Drawing Transmittal"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 9,
+        color: 'var(--mi)',
+        marginTop: 2
+      }
+    }, t.ref, " \xB7 ", t.date, " \xB7 ", t.proj.code)), /*#__PURE__*/React.createElement("div", {
+      style: {
+        textAlign: 'right'
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "lbl"
+    }, "To"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontWeight: 600
+      }
+    }, t.to), /*#__PURE__*/React.createElement("span", {
+      className: "tag",
+      style: {
+        display: 'inline-block',
+        marginTop: 3,
+        background: 'var(--bg)',
+        color: 'var(--ch)'
+      }
+    }, t.purpose))), /*#__PURE__*/React.createElement("table", {
+      className: "tbl"
+    }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null, "#"), /*#__PURE__*/React.createElement("th", null, "Drawing No."), /*#__PURE__*/React.createElement("th", null, "Title"), /*#__PURE__*/React.createElement("th", null, "Rev"), /*#__PURE__*/React.createElement("th", null, "Status"))), /*#__PURE__*/React.createElement("tbody", null, twgs.map((d, i) => /*#__PURE__*/React.createElement("tr", {
+      key: d.id
+    }, /*#__PURE__*/React.createElement("td", {
+      style: {
+        color: 'var(--sl)'
+      }
+    }, i + 1), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+      className: "drn"
+    }, d.num)), /*#__PURE__*/React.createElement("td", null, d.title), /*#__PURE__*/React.createElement("td", {
+      style: {
+        fontWeight: 600
+      }
+    }, d.rev), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement(Badge, {
+      s: d.status
+    }))))))));
+  }));
+}
+function ArchivedView({
+  projects,
+  onRestore,
+  onDelete,
+  onOpen
+}) {
+  const arch = projects.filter(p => p.status === 'archived');
+  if (!arch.length) return /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: 'center',
+      padding: 40,
+      color: 'var(--sl)'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 32,
+      marginBottom: 8
+    }
+  }, "\uD83D\uDCE6"), /*#__PURE__*/React.createElement("div", null, "No archived projects"), /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 11.5,
+      marginTop: 6
+    }
+  }, "Archive completed projects from their detail page"));
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "arch-banner",
+    style: {
+      marginBottom: 16
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 22
+    }
+  }, "\uD83D\uDCE6"), /*#__PURE__*/React.createElement("p", null, "All data preserved. OneDrive folders untouched. Restore any time.")), /*#__PURE__*/React.createElement("div", {
+    className: "g3"
+  }, arch.map(p => {
+    const drw = Object.values(p.lod || {}).flatMap(d => d.drawings || []);
+    const done = drw.filter(d => d.status === 'approved').length;
+    return /*#__PURE__*/React.createElement("div", {
+      key: p.id,
+      className: "pc pc-archived",
+      onClick: () => onOpen(p.id)
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "pc-top",
+      style: {
+        background: 'var(--lt)'
+      }
+    }), /*#__PURE__*/React.createElement("div", {
+      className: "pc-bd"
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'flex-start'
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "pc-code"
+    }, p.code), /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 8,
+        background: '#fff3e0',
+        color: '#e65100',
+        fontWeight: 700,
+        padding: '2px 6px',
+        borderRadius: 2
+      }
+    }, "ARCHIVED")), /*#__PURE__*/React.createElement("div", {
+      className: "pc-name"
+    }, p.name), /*#__PURE__*/React.createElement("div", {
+      className: "pc-cl"
+    }, p.client), /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginTop: 6,
+        fontSize: 10,
+        color: 'var(--sl)'
+      }
+    }, drw.length, " drawings \xB7 ", done, " approved \xB7 Archived ", p.archivedAt ? new Date(p.archivedAt).toLocaleDateString() : ''), /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginTop: 9,
+        display: 'flex',
+        gap: 6
+      }
+    }, /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-ok btn-sm",
+      style: {
+        flex: 1,
+        justifyContent: 'center'
+      },
+      onClick: e => {
+        e.stopPropagation();
+        onRestore(p.id);
+      }
+    }, "\u21A9 Restore"), /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-danger btn-sm",
+      style: {
+        justifyContent: 'center'
+      },
+      title: "Delete from DPM permanently",
+      onClick: e => {
+        e.stopPropagation();
+        if (window.confirm('Delete project from DPM? OneDrive folders are NOT deleted.')) {
+          onDelete(p.id);
+        }
+      }
+    }, " Del"))));
+  })));
+}
+
+// ─── SETTINGS ─────────────────────────────────────────────────
+function SettingsPage({
+  settings,
+  onSave,
+  userInfo,
+  onSignOut
+}) {
+  const [f, sf] = useState({
+    ...settings
+  });
+  const u = (k, v) => sf(p => ({
+    ...p,
+    [k]: v
+  }));
+  const logoRef = useRef();
+  const handleLogo = e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const r = new FileReader();
+    r.onload = ev => u('firmLogo', ev.target.result);
+    r.readAsDataURL(file);
+  };
+  // OneDrive path settings
+  const [paths, setPaths] = React.useState(() => {
+    try { return JSON.parse(localStorage.getItem('dpm_paths') || '{}'); } catch { return {}; }
+  });
+  const upPath = (k, v) => setPaths(p => ({...p, [k]: v}));
+
+  const save = () => {
+    onSave(f);
+    // Save paths to localStorage
+    savePaths(
+      paths.dataFolder || ONEDRIVE_FOLDER_DEFAULT,
+      paths.dataFile   || DATA_FILE_DEFAULT,
+      paths.projectsFolder || ONEDRIVE_FOLDER_DEFAULT,
+      paths.localPath || ''
+    );
+    alert('Settings saved! Reload the app for path changes to take effect.');
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      maxWidth: 720
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "set-sec"
+  }, /*#__PURE__*/React.createElement("h3", null, "Microsoft Account"), /*#__PURE__*/React.createElement("div", {
+    className: "card card-bd",
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 40,
+      height: 40,
+      borderRadius: '50%',
+      background: 'var(--wm)',
+      border: '1px solid var(--bd)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      fontSize: 18
+    }
+  }, "\uD83D\uDC64"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 600,
+      fontSize: 13
+    }
+  }, userInfo?.displayName || 'Signed In'), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: 'var(--mi)'
+    }
+  }, userInfo?.mail || userInfo?.userPrincipalName || ''), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: 'var(--sl)',
+      marginTop: 2
+    }
+  }, "Data syncing via OneDrive \u2014 ", /*#__PURE__*/React.createElement("strong", null, "DPM App/DPM-Data.json"))), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-g btn-sm",
+    onClick: onSignOut
+  }, "Sign Out"))), /*#__PURE__*/React.createElement("div", {
+    className: "set-sec"
+  }, /*#__PURE__*/React.createElement("h3", null, "Firm Information"), /*#__PURE__*/React.createElement("div", {
+    className: "card card-bd"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fr"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Firm Name"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: f.firmName,
+    onChange: e => u('firmName', e.target.value)
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Tagline"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: f.firmTagline,
+    onChange: e => u('firmTagline', e.target.value)
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "fr"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Location"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: f.firmLocation,
+    onChange: e => u('firmLocation', e.target.value)
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Owner Initials"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: f.ownerInitials,
+    onChange: e => u('ownerInitials', e.target.value.toUpperCase().slice(0, 4)),
+    placeholder: "WJ"
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "fr"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Email"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: f.firmEmail,
+    onChange: e => u('firmEmail', e.target.value)
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Phone"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: f.firmPhone,
+    onChange: e => u('firmPhone', e.target.value)
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "fg"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fl"
+  }, "Copyright Statement"), /*#__PURE__*/React.createElement("input", {
+    className: "fi",
+    value: f.copyright,
+    onChange: e => u('copyright', e.target.value)
+  })))), /*#__PURE__*/React.createElement("div", {className:"set-sec"},
+    /*#__PURE__*/React.createElement("h3", null, "OneDrive Paths"),
+    /*#__PURE__*/React.createElement("div", {className:"card card-bd"},
+      /*#__PURE__*/React.createElement("div", {className:"alert al-i", style:{marginBottom:14}},
+        "Set the OneDrive folder paths for your data file and project folders. Use the path as it appears in OneDrive (e.g. ",
+        /*#__PURE__*/React.createElement("code", null, "02-WJ-Contracting/WJ Apps/PDM"), ")."
+      ),
+      /*#__PURE__*/React.createElement("div", {className:"fg"},
+        /*#__PURE__*/React.createElement("label", {className:"fl"}, "Data file folder (where DPM-Data.json is saved)"),
+        /*#__PURE__*/React.createElement("input", {
+          className:"fi",
+          value: paths.dataFolder || ONEDRIVE_FOLDER_DEFAULT,
+          onChange: e => upPath('dataFolder', e.target.value),
+          placeholder: "e.g. 00-WJ Apps/DPM APP"
+        }),
+        /*#__PURE__*/React.createElement("div", {style:{fontSize:10.5,color:'var(--mi)',marginTop:3}},
+          "Current: ", paths.dataFolder || ONEDRIVE_FOLDER_DEFAULT, " / ", paths.dataFile || DATA_FILE_DEFAULT
+        )
+      ),
+      /*#__PURE__*/React.createElement("div", {className:"fg"},
+        /*#__PURE__*/React.createElement("label", {className:"fl"}, "Data file name"),
+        /*#__PURE__*/React.createElement("input", {
+          className:"fi",
+          value: paths.dataFile || DATA_FILE_DEFAULT,
+          onChange: e => upPath('dataFile', e.target.value),
+          placeholder: "DPM-Data.json"
+        })
+      ),
+      /*#__PURE__*/React.createElement("div", {className:"fg"},
+        /*#__PURE__*/React.createElement("label", {className:"fl"}, "Project folders location (where project folders are created)"),
+        /*#__PURE__*/React.createElement("input", {
+          className:"fi",
+          value: paths.projectsFolder || ONEDRIVE_FOLDER_DEFAULT,
+          onChange: e => upPath('projectsFolder', e.target.value),
+          placeholder: "e.g. 01-WJ studio/00-PROJECTS"
+        }),
+        /*#__PURE__*/React.createElement("div", {style:{fontSize:10.5,color:'var(--mi)',marginTop:3}},
+          "Project folders will be created as: ", (paths.projectsFolder || ONEDRIVE_FOLDER_DEFAULT), " / [project code] — [project name]"
+        )
+      ),
+      /*#__PURE__*/React.createElement("div", {className:"fg"},
+        /*#__PURE__*/React.createElement("label", {className:"fl"}, "Local Windows path — opens folders in Explorer on your PC"),
+        /*#__PURE__*/React.createElement("input", {
+          className:"fi",
+          value: paths.localPath || "",
+          onChange: e => upPath('localPath', e.target.value),
+          placeholder: "e.g. C:\\Users\\USER\\OneDrive\\01-WJ studio\\00-PROJECTS"
+        }),
+        /*#__PURE__*/React.createElement("div", {style:{fontSize:10.5,color:'var(--mi)',marginTop:3}},
+          "Full Windows path to your projects folder. When set, 📁 buttons open directly in Windows Explorer instead of the browser."
+        )
+      ),
+      /*#__PURE__*/React.createElement("div", {className:"alert al-w", style:{marginTop:4,marginBottom:0}},
+        "After changing paths, click Save Settings and reload the app. Make sure the folder already exists in your OneDrive."
+      )
+    )
+  ), /*#__PURE__*/React.createElement("div", {
+    className: "set-sec"
+  }, /*#__PURE__*/React.createElement("h3", null, "Firm Logo"), /*#__PURE__*/React.createElement("div", {
+    className: "card card-bd"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 100,
+      height: 52,
+      border: '1px solid var(--bd)',
+      borderRadius: 'var(--r)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      background: 'var(--wm)',
+      overflow: 'hidden'
+    }
+  }, f.firmLogo ? /*#__PURE__*/React.createElement("img", {
+    src: f.firmLogo,
+    style: {
+      maxWidth: '100%',
+      maxHeight: '100%',
+      objectFit: 'contain'
+    },
+    alt: "logo"
+  }) : /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      color: 'var(--sl)'
+    }
+  }, "No logo")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 11.5,
+      color: 'var(--mi)',
+      marginBottom: 8,
+      lineHeight: 1.5
+    }
+  }, "PNG with transparent background recommended."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 6
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "file",
+    accept: "image/*",
+    ref: logoRef,
+    style: {
+      display: 'none'
+    },
+    onChange: handleLogo
+  }), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-g btn-sm",
+    onClick: () => logoRef.current.click()
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "up",
+    sz: 10
+  }), " Upload"), f.firmLogo && /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-g btn-sm",
+    onClick: () => u('firmLogo', null)
+  }, "Remove")))))), /*#__PURE__*/React.createElement("div", {
+    className: "set-sec"
+  }, /*#__PURE__*/React.createElement("h3", null, "App Information"), /*#__PURE__*/React.createElement("div", {
+    className: "card card-bd"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "ig"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "iif"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "lbl"
+  }, "Version"), /*#__PURE__*/React.createElement("div", {
+    className: "val"
+  }, "v", APP_VERSION)), /*#__PURE__*/React.createElement("div", {
+    className: "iif"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "lbl"
+  }, "Data Storage"), /*#__PURE__*/React.createElement("div", {
+    className: "val"
+  }, "OneDrive via Microsoft Graph")), /*#__PURE__*/React.createElement("div", {
+    className: "iif"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "lbl"
+  }, "Data File"), /*#__PURE__*/React.createElement("div", {
+    className: "val"
+  }, "DPM App / DPM-Data.json")), /*#__PURE__*/React.createElement("div", {
+    className: "iif"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "lbl"
+  }, "Sync"), /*#__PURE__*/React.createElement("div", {
+    className: "val"
+  }, "Real-time, all devices"))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      justifyContent: 'flex-end',
+      paddingTop: 6
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-p",
+    onClick: save
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "check",
+    sz: 11
+  }), " Save Settings")));
+}
+
+// ─── SIGN IN SCREEN ───────────────────────────────────────────
+function SignInScreen({
+  onSignIn,
+  loading,
+  error
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    className: "signin"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "signin-card"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 52,
+      height: 52,
+      background: '#1A1818',
+      borderRadius: 10,
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      margin: '0 auto 16px'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: 'Georgia,serif',
+      color: '#9E9690',
+      fontSize: 28
+    }
+  }, "D")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: 'Georgia,serif',
+      fontSize: 24,
+      color: '#1A1818',
+      marginBottom: 4
+    }
+  }, "Design Project Manager"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9.5,
+      letterSpacing: 2,
+      color: '#A8A5A1',
+      marginBottom: 24
+    }
+  }, "v", APP_VERSION, " \u2014 Sign in to continue"), /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 12,
+      color: '#7A7876',
+      marginBottom: 20,
+      lineHeight: 1.65
+    }
+  }, "Sign in with your Microsoft account to access your projects. Your data is stored privately in your own OneDrive."), error && /*#__PURE__*/React.createElement("div", {
+    className: "alert al-w",
+    style: {
+      marginBottom: 14,
+      textAlign: 'left'
+    }
+  }, error), /*#__PURE__*/React.createElement("button", {
+    className: "ms-btn",
+    onClick: onSignIn,
+    disabled: loading
+  }, /*#__PURE__*/React.createElement("svg", {
+    className: "ms-logo",
+    viewBox: "0 0 21 21",
+    fill: "none",
+    xmlns: "http://www.w3.org/2000/svg"
+  }, /*#__PURE__*/React.createElement("rect", {
+    x: "1",
+    y: "1",
+    width: "9",
+    height: "9",
+    fill: "#F25022"
+  }), /*#__PURE__*/React.createElement("rect", {
+    x: "11",
+    y: "1",
+    width: "9",
+    height: "9",
+    fill: "#7FBA00"
+  }), /*#__PURE__*/React.createElement("rect", {
+    x: "1",
+    y: "11",
+    width: "9",
+    height: "9",
+    fill: "#00A4EF"
+  }), /*#__PURE__*/React.createElement("rect", {
+    x: "11",
+    y: "11",
+    width: "9",
+    height: "9",
+    fill: "#FFB900"
+  })), loading ? 'Signing in…' : 'Sign in with Microsoft'), /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 10,
+      color: '#C4C0BC',
+      marginTop: 14,
+      lineHeight: 1.6
+    }
+  }, "Your projects are stored in your personal OneDrive under ", /*#__PURE__*/React.createElement("strong", null, "DPM App/DPM-Data.json"), ". No data is shared with anyone.")));
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ERROR BOUNDARY
+// ═══════════════════════════════════════════════════════════════
+class ErrorBoundary extends React.Component {
+  constructor(p) {
+    super(p);
+    this.state = {
+      hasError: false,
+      error: null
+    };
+  }
+  static getDerivedStateFromError(e) {
+    return {
+      hasError: true,
+      error: e
+    };
+  }
+  componentDidCatch(e, info) {
+    console.error('DPM Error:', e, info);
+  }
+  render() {
+    if (!this.state.hasError) return this.props.children;
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        height: '100vh',
+        background: '#F5F3F0',
+        fontFamily: "'Jost',sans-serif"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        background: 'white',
+        border: '1px solid #D4CFC9',
+        borderRadius: 8,
+        padding: 32,
+        maxWidth: 440,
+        textAlign: 'center'
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 32,
+        marginBottom: 10
+      }
+    }, "\u26A0\uFE0F"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontFamily: 'Georgia,serif',
+        fontSize: 20,
+        marginBottom: 8
+      }
+    }, "Something went wrong"), /*#__PURE__*/React.createElement("p", {
+      style: {
+        fontSize: 12,
+        color: '#7A7876',
+        marginBottom: 16,
+        lineHeight: 1.7
+      }
+    }, "Your data is safe. Click reload to continue."), /*#__PURE__*/React.createElement("div", {
+      style: {
+        background: '#FFF3E0',
+        border: '1px solid #FFE0B2',
+        borderRadius: 4,
+        padding: '8px 12px',
+        fontSize: 11,
+        color: '#E65100',
+        marginBottom: 16,
+        textAlign: 'left'
+      }
+    }, this.state.error?.message || 'Unknown error'), /*#__PURE__*/React.createElement("button", {
+      onClick: () => window.location.reload(),
+      style: {
+        background: '#1A1818',
+        color: 'white',
+        border: 'none',
+        padding: '12px 24px',
+        borderRadius: 4,
+        fontSize: 13,
+        cursor: 'pointer',
+        width: '100%'
+      }
+    }, "\u21BA Reload DPM")));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN APP
+// ═══════════════════════════════════════════════════════════════
+function App() {
+  const [authState, sAuthState] = useState('checking'); // checking|signed-out|signed-in
+  const [authError, sAuthError] = useState(null);
+  const [userInfo, sUserInfo] = useState(null);
+  const [projects, sProjects] = useState([]);
+  const [settings, sSettings] = useState(DEFAULT_SETTINGS);
+  const [saveStatus, sSaveStatus] = useState('idle');
+  const [view, sView] = useState('dashboard');
+  const [projId, sProjId] = useState(null);
+  const [showNew, sNew] = useState(false);
+  const [search, sSearch] = useState('');
+  const [installPrompt, sInstallPrompt] = useState(() => window.__dpmInstallEvt || null);
+  const [showInstallBanner, sInstallBanner] = useState(() => !!window.__dpmInstallEvt);
+  const saveTimer = useRef(null);
+  const isFirst = useRef(true);
+
+  // Wire install prompt
+  useEffect(() => {
+    window.__dpmOnInstallReady = e => {
+      sInstallPrompt(e);
+      sInstallBanner(true);
+    };
+    window.__dpmOnInstalled = () => {
+      sInstallBanner(false);
+    };
+    if (window.__dpmInstallEvt) {
+      sInstallPrompt(window.__dpmInstallEvt);
+      sInstallBanner(true);
+    }
+    return () => {
+      window.__dpmOnInstallReady = null;
+      window.__dpmOnInstalled = null;
+    };
+  }, []);
+  const doInstall = async () => {
+    if (!installPrompt) return;
+    installPrompt.prompt();
+    const {
+      outcome
+    } = await installPrompt.userChoice;
+    if (outcome === 'accepted') {
+      sInstallBanner(false);
+      sInstallPrompt(null);
+    }
+  };
+
+  // Check auth on load
+  useEffect(() => {
+    (async () => {
+      // Wait for MSAL library to load from CDN
+      const ok = await initMsal();
+      if (!ok) {
+        sAuthState('signed-out');
+        sAuthError('Could not load Microsoft authentication library. Check your internet connection and refresh.');
+        return;
+      }
+      try {
+        await msalInstance.handleRedirectPromise();
+        const accounts = msalInstance.getAllAccounts();
+        if (accounts.length) {
+          sAuthState('signed-in');
+          loadData();
+          graphGetUserInfo().then(info => {
+            if (info) sUserInfo(info);
+          }).catch(() => {});
+        } else {
+          sAuthState('signed-out');
+        }
+      } catch (e) {
+        console.error('Auth check failed:', e);
+        sAuthState('signed-out');
+      }
+    })();
+  }, []);
+  const signIn = async () => {
+    sAuthState('checking');
+    sAuthError(null);
+    if (!msalInstance) {
+      const ok = await initMsal();
+      if (!ok) {
+        sAuthState('signed-out');
+        sAuthError('Authentication library failed to load. Please refresh the page.');
+        return;
+      }
+    }
+    try {
+      const result = await msalInstance.loginPopup({
+        scopes: LOGIN_SCOPES
+      });
+      if (result) {
+        sAuthState('signed-in');
+        loadData();
+        graphGetUserInfo().then(info => {
+          if (info) sUserInfo(info);
+        }).catch(() => {});
+      }
+    } catch (e) {
+      if (e.errorCode !== 'user_cancelled') {
+        sAuthError('Sign in failed: ' + e.message);
+      }
+      sAuthState('signed-out');
+    }
+  };
+  const signOut = async () => {
+    if (!confirm('Sign out of DPM?')) return;
+    try {
+      await msalInstance.logoutPopup();
+    } catch (e) {}
+    sAuthState('signed-out');
+    sProjects([]);
+    sUserInfo(null);
+    sView('dashboard');
+  };
+  const loadData = async () => {
+    sSaveStatus('syncing');
+    try {
+      const data = await graphRead();
+      if (data && typeof data === 'object') {
+        const projs = Array.isArray(data.projects) ? data.projects : [];
+        const sett  = data.settings && typeof data.settings === 'object' && !Array.isArray(data.settings) ? data.settings : {};
+        sProjects(projs);
+        sSettings({...DEFAULT_SETTINGS, ...sett});
+        sSaveStatus('saved');
+        setTimeout(() => sSaveStatus('idle'), 2000);
+      } else {
+        // File not found (404) — new location, write a fresh file
+        console.log('DPM: No data file found at', getDataFolder()+'/'+getDataFile(), '— creating new one');
+        await graphWrite({projects:[], settings, lastSaved:new Date().toISOString(), version:'4.0.0'});
+        sSaveStatus('saved');
+        setTimeout(() => sSaveStatus('idle'), 2000);
+      }
+    } catch (e) {
+      console.warn('Load failed:', e.message);
+      sSaveStatus('error');
+      setTimeout(() => sSaveStatus('idle'), 5000);
+    }
+    isFirst.current = false;
+  };
+
+  // Auto-save on data change
+  useEffect(() => {
+    if (isFirst.current || authState !== 'signed-in') return;
+    sSaveStatus('saving');
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      try {
+        await graphWrite({
+          projects,
+          settings,
+          lastSaved: new Date().toISOString(),
+          version: APP_VERSION
+        });
+        sSaveStatus('saved');
+        setTimeout(() => sSaveStatus('idle'), 2500);
+      } catch (e) {
+        console.error('Save failed:', e.message);
+        sSaveStatus('error');
+        setTimeout(() => sSaveStatus('idle'), 4000);
+      }
+    }, 1800);
+  }, [projects, settings]);
+  const updProj = u => sProjects(ps => ps.map(p => p.id === u.id ? u : p));
+  const activeProj = projects.find(p => p.id === projId);
+  const activeProjects = projects.filter(p => p.status !== 'archived');
+  const filtered = activeProjects.filter(p => !search || [p.name, p.code, p.client].some(s => s.toLowerCase().includes(search.toLowerCase())));
+  const nav = [{
+    id: 'dashboard',
+    l: 'Dashboard',
+    ic: 'dash'
+  }, {
+    id: 'projects',
+    l: 'All Projects',
+    ic: 'proj'
+  }, {
+    id: 'archived',
+    l: `Archived${projects.filter(p => p.status === 'archived').length ? ` (${projects.filter(p => p.status === 'archived').length})` : ''}`,
+    ic: 'arch'
+  }, {
+    id: 'drawings',
+    l: 'Drawing Register',
+    ic: 'drw'
+  }, {
+    id: 'transmittals',
+    l: 'Transmittals',
+    ic: 'snd'
+  }, {
+    id: 'settings',
+    l: 'Settings',
+    ic: 'set'
+  }];
+  const title = view === 'project' && activeProj ? activeProj.name : {
+    dashboard: 'Dashboard',
+    projects: 'All Projects',
+    archived: 'Archived',
+    drawings: 'Drawing Register',
+    transmittals: 'Transmittals',
+    settings: 'Settings'
+  }[view] || 'DPM';
+  const saveLbl = {
+    saving: 'Saving…',
+    saved: 'Synced ✓',
+    error: 'Sync failed',
+    syncing: 'Loading…'
+  };
+  const saveCls = {
+    saving: 'ss-saving',
+    saved: 'ss-saved',
+    error: 'ss-error',
+    syncing: 'ss-syncing'
+  };
+  if (authState === 'checking') return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("style", null, CSS), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      height: '100vh',
+      background: '#1A1818',
+      flexDirection: 'column',
+      gap: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 28,
+      height: 28,
+      border: '2px solid #3D3B3B',
+      borderTopColor: '#9E9690',
+      borderRadius: '50%',
+      animation: 'spin .8s linear infinite'
+    }
+  }), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      letterSpacing: 3,
+      color: '#7A7876'
+    }
+  }, "CONNECTING")));
+  if (authState === 'signed-out') return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("style", null, CSS), /*#__PURE__*/React.createElement(SignInScreen, {
+    onSignIn: signIn,
+    loading: authState === 'checking',
+    error: authError
+  }));
+  return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("style", null, CSS), showNew && /*#__PURE__*/React.createElement(NewProjModal, {
+    onClose: () => sNew(false),
+    onSave: p => {
+      sProjects(ps => [...ps, p]);
+      sProjId(p.id);
+      sView('project');
+    },
+    projects: projects,
+    settings: settings
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexDirection: 'column',
+      height: '100vh'
+    }
+  }, showInstallBanner && /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: 'var(--bk)',
+      color: 'white',
+      padding: '8px 18px',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      fontSize: 11.5,
+      flexShrink: 0
+    }
+  }, /*#__PURE__*/React.createElement("span", null, "\uD83D\uDCF2 Install DPM as an app on this device"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 7
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-a btn-sm",
+    onClick: doInstall
+  }, "Install"), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-g btn-sm",
+    style: {
+      color: 'var(--sl)',
+      borderColor: 'var(--ch)'
+    },
+    onClick: () => sInstallBanner(false)
+  }, "Later"))), /*#__PURE__*/React.createElement("div", {
+    className: "app",
+    style: {
+      flex: 1,
+      minHeight: 0
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "sb"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "sb-logo"
+  }, settings.firmLogo ? /*#__PURE__*/React.createElement("img", {
+    src: settings.firmLogo,
+    className: "sb-logo-img",
+    alt: "logo"
+  }) : /*#__PURE__*/React.createElement("div", {
+    className: "sb-logo-box"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "sb-logo-txt"
+  }, settings.firmName?.split(' ').map(w => w[0]).join('').slice(0, 4) || 'DPM')), /*#__PURE__*/React.createElement("div", {
+    className: "sb-name"
+  }, settings.firmName || 'Design Project Manager'), userInfo && /*#__PURE__*/React.createElement("div", {
+    className: "sb-user"
+  }, "\uD83D\uDC64 ", userInfo.displayName || userInfo.mail || ''), /*#__PURE__*/React.createElement("div", {
+    className: "ver"
+  }, "v", APP_VERSION)), /*#__PURE__*/React.createElement("div", {
+    className: "nav"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "ns"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "nl"
+  }, "Navigation"), nav.map(n => /*#__PURE__*/React.createElement("div", {
+    key: n.id,
+    className: `ni${view === n.id ? ' on' : ''}`,
+    onClick: () => {
+      sView(n.id);
+      sProjId(null);
+    }
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: n.ic,
+    sz: 13
+  }), n.l))), /*#__PURE__*/React.createElement("div", {
+    className: "ns"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "nl"
+  }, "Active Projects (", activeProjects.length, ")"), activeProjects.map(p => /*#__PURE__*/React.createElement("div", {
+    key: p.id,
+    className: `ni${projId === p.id && view === 'project' ? ' on' : ''}`,
+    onClick: () => {
+      sProjId(p.id);
+      sView('project');
+    },
+    style: {
+      paddingLeft: 9
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "ni-dot",
+    style: {
+      background: calcP(p.phases) > 80 ? '#3D3B3B' : '#9E9690'
+    }
+  }), /*#__PURE__*/React.createElement("span", {
+    style: {
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap'
+    }
+  }, p.code, " \u2014 ", p.name))))), /*#__PURE__*/React.createElement("div", {
+    className: "sb-ft"
+  }, /*#__PURE__*/React.createElement("p", null, settings.firmLocation || '—'), /*#__PURE__*/React.createElement("p", {
+    style: {
+      marginTop: 2,
+      fontSize: 6.5,
+      color: '#2A2828'
+    }
+  }, settings.copyright || ''))), /*#__PURE__*/React.createElement("div", {
+    className: "main"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "topbar"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8
+    }
+  }, view === 'project' && /*#__PURE__*/React.createElement("button", {
+    style: {
+      background: 'none',
+      border: 'none',
+      cursor: 'pointer',
+      color: 'var(--mi)',
+      display: 'flex',
+      alignItems: 'center'
+    },
+    onClick: () => sView('dashboard')
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "back",
+    sz: 14
+  })), /*#__PURE__*/React.createElement("span", {
+    className: "tb-title"
+  }, title)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8
+    }
+  }, saveStatus !== 'idle' && /*#__PURE__*/React.createElement("div", {
+    className: `ss ${saveCls[saveStatus]}`
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "cloud",
+    sz: 10
+  }), saveLbl[saveStatus]), (view === 'dashboard' || view === 'projects' || view === 'archived') && /*#__PURE__*/React.createElement("input", {
+    style: {
+      padding: '5px 9px',
+      border: '1px solid var(--bd)',
+      borderRadius: 'var(--r)',
+      fontFamily: 'var(--fb)',
+      fontSize: 11,
+      outline: 'none',
+      width: 140
+    },
+    placeholder: "Search\u2026",
+    value: search,
+    onChange: e => sSearch(e.target.value)
+  }), view !== 'settings' && view !== 'archived' && /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-p btn-sm",
+    onClick: () => sNew(true)
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "plus",
+    sz: 10
+  }), " New Project"))), /*#__PURE__*/React.createElement("div", {
+    className: "content"
+  }, view === 'dashboard' && /*#__PURE__*/React.createElement(Dashboard, {
+    projects: filtered,
+    onOpen: id => {
+      sProjId(id);
+      sView('project');
+    }
+  }), view === 'projects' && /*#__PURE__*/React.createElement("div", {
+    className: "g3"
+  }, filtered.map(p => {
+    const pct = calcP(p.phases);
+    const drw = Object.values(p.lod || {}).flatMap(d => d.drawings || []);
+    return /*#__PURE__*/React.createElement("div", {
+      key: p.id,
+      className: "pc",
+      onClick: () => {
+        sProjId(p.id);
+        sView('project');
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "pc-top",
+      style: {
+        background: '#9E9690'
+      }
+    }), /*#__PURE__*/React.createElement("div", {
+      className: "pc-bd"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "pc-code"
+    }, p.code), /*#__PURE__*/React.createElement("div", {
+      className: "pc-name"
+    }, p.name), /*#__PURE__*/React.createElement("div", {
+      className: "pc-cl"
+    }, p.client), /*#__PURE__*/React.createElement("div", {
+      style: {
+        height: 1,
+        background: 'var(--bg)',
+        margin: '8px 0'
+      }
+    }), [['Location', p.location], ['Target', p.targetDate], ['Contract', p.contractValue]].map(([k, v]) => /*#__PURE__*/React.createElement("div", {
+      key: k,
+      style: {
+        display: 'flex',
+        justifyContent: 'space-between',
+        marginBottom: 3
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 10,
+        color: 'var(--sl)'
+      }
+    }, k), /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 10,
+        fontWeight: 500
+      }
+    }, v || '—'))), /*#__PURE__*/React.createElement("div", {
+      className: "pb-w",
+      style: {
+        marginTop: 8
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "pb",
+      style: {
+        width: pct + '%'
+      }
+    })), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: 'flex',
+        justifyContent: 'space-between',
+        marginTop: 4
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: 'flex',
+        gap: 3
+      }
+    }, (p.disciplines || []).map(d => /*#__PURE__*/React.createElement("span", {
+      key: d,
+      className: `tag t-${d.toLowerCase()}`
+    }, d))), /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 10,
+        fontWeight: 600,
+        color: 'var(--mi)'
+      }
+    }, pct, "%"))));
+  })), view === 'archived' && /*#__PURE__*/React.createElement(ArchivedView, {
+    projects: projects,
+    onRestore: id => updProj({
+      ...projects.find(p => p.id === id),
+      status: 'active',
+      archivedAt: null
+    }),
+    onDelete: id => sProjects(ps => ps.filter(p => p.id !== id)),
+    onOpen: id => {
+      sProjId(id);
+      sView('project');
+    }
+  }), view === 'drawings' && /*#__PURE__*/React.createElement(GlobalDrawings, {
+    projects: activeProjects
+  }), view === 'transmittals' && /*#__PURE__*/React.createElement(GlobalTrans, {
+    projects: activeProjects
+  }), view === 'settings' && /*#__PURE__*/React.createElement(SettingsPage, {
+    settings: settings,
+    onSave: sSettings,
+    userInfo: userInfo,
+    onSignOut: signOut
+  }), view === 'project' && activeProj && /*#__PURE__*/React.createElement(ProjDetail, {
+    project: activeProj,
+    onBack: () => sView('dashboard'),
+    onUpdate: updProj,
+    settings: settings
+  }))))));
+}
+window.addEventListener('load', () => {
+  document.getElementById('loading').style.display = 'none';
+  document.getElementById('root').style.display = 'block';
+  ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(ErrorBoundary, null, React.createElement(App)));
+});
+
+</script>
+</body>
+</html>
